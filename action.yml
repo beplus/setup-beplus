@@ -46,8 +46,14 @@ runs:
         beplus --version
 
     - name: beplus npm auth
-      if: ${{ inputs.BE_NPM_AUTH == 'true' && env.BE_NPM_TARGET && env.BE_NPM_TOKEN }}
+      if: ${{ inputs.BE_NPM_AUTH == 'true'}}
       shell: bash
       run: |
         set -euo pipefail
-        beplus npm auth
+
+        if [[ -n "${BE_NPM_TARGET:-}" ]] && \
+           [[ -n "${BE_NPM_TOKEN:-}" ]]; then
+          beplus npm auth
+        else
+          echo "Skipping beplus npm auth (BE_NPM_AUTH=${{ inputs.BE_NPM_AUTH }} because one of (BE_NPM_TARGET,BE_NPM_TOKEN) is missing."
+        fi
