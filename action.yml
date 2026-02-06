@@ -1,0 +1,53 @@
+name: "Setup beplus CLI"
+description: "Install and verify beplus CLI + authenticate npm for beplus.cloud packages"
+inputs:
+  BE_CLI_VERSION:
+    description: "Version of beplus CLI to install (default: latest)"
+    required: false
+    default: "latest"
+  BE_NPM_AUTH:
+    description: "Authenticate beplus.cloud NPM? (requires BE_NPM_TARGET and BE_NPM_TOKEN env vars)"
+    required: false
+    default: "false"
+  BE_PREFIX:
+    description: "Install prefix for beplus binaries (must be writable)."
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install @beplus/be
+      shell: bash
+      env:
+        BE_PREFIX: ${{ inputs.BE_PREFIX }}
+      run: |
+        set -euo pipefail
+        curl -fsSL "https://raw.githubusercontent.com/beplus/be/main/scripts/install.sh" | bash -s -- --ci
+
+    - name: Export BE_PREFIX + PATH for GitHub Actions
+      shell: bash
+      run: |
+        set -euo pipefail
+        BE_PREFIX="${BE_PREFIX:-$HOME/.beplus}"
+        echo "BE_PREFIX=$BE_PREFIX" >> "$GITHUB_ENV"
+        echo "$BE_PREFIX/bin" >> "$GITHUB_PATH"
+
+    - name: Install beplus CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        be ${{ inputs.BE_CLI_VERSION }}
+
+    - name: Verify beplus CLI version
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "beplus CLI version:"
+        beplus --version
+
+    - name: beplus npm auth
+      if: ${{ inputs.BE_NPM_AUTH == 'true' && env.BE_NPM_TARGET && env.BE_NPM_TOKEN }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        beplus npm auth
