@@ -78,3 +78,10 @@ If your app has a different name, override it:
    - Add **Secret**: `BE_RELEASE_GITHUB_APP_PRIVATE_KEY` (generate and copy from app page)
 
 Alternatively, set these at the **organization level** for use across multiple repos.
+
+---
+
+## See also
+
+- [Setup beplus Git](../git/README.md)
+- [Setup beplus Provisioning](../provisioning/README.md)

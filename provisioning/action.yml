@@ -1,0 +1,60 @@
+name: "Setup beplus Provisioning"
+description: "Configure AWS credentials and install beplus Provisioning tools"
+inputs:
+  AWS_REGION:
+    description: "AWS region"
+    required: false
+    default: "us-east-1"
+  BE_AWS_ACCOUNT_ID:
+    description: "AWS Account ID for OIDC role assumption"
+    required: true
+  BE_PROVISIONING_VERSION:
+    description: "Version of beplus Provisioning to install (default: latest)"
+    required: false
+    default: "latest"
+  BE_PROVISIONING_PLUGIN_MOBILE_ENABLED:
+    description: "Install @beplus/provisioning-plugin-mobile? (true, false, 1, 0, '1', '0')"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.BE_AWS_ACCOUNT_ID }}:role/github-actions-${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.ref_name }}-provisioning
+        aws-region: ${{ inputs.AWS_REGION }}
+
+    - name: Verify AWS identity
+      shell: bash
+      run: aws sts get-caller-identity
+
+    - name: Install beplus Provisioning packages
+      shell: bash
+      env:
+        PLUGIN_MOBILE_ENABLED: ${{ inputs.BE_PROVISIONING_PLUGIN_MOBILE_ENABLED }}
+      run: |
+        set -euo pipefail
+
+        # Base packages to install
+        PACKAGES="@beplus/provisioning@${{ inputs.BE_PROVISIONING_VERSION }}"
+
+        # Check if mobile plugin should be installed
+        if [[ "${PLUGIN_MOBILE_ENABLED}" =~ ^(true|1|"1")$ ]]; then
+          echo "beplus Provisioning Mobile plugin enabled"
+          PACKAGES="${PACKAGES} @beplus/provisioning-plugin-mobile@${{ inputs.BE_PROVISIONING_VERSION }}"
+        else
+          echo "beplus Provisioning Mobile plugin disabled"
+        fi
+
+        echo "Installing: ${PACKAGES}"
+        npm install -g ${PACKAGES}
+
+        echo "beplus Provisioning packages installed"
+
+    - name: Install beplus Provisioning
+      shell: bash
+      run: |
+        beplus-provision --version
+        beplus-provision

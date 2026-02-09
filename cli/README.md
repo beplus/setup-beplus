@@ -119,3 +119,10 @@ If you override `BE_PREFIX`, ensure it points to a writable directory.
 This is expected unless:
 - `BE_NPM_AUTH` is set to `"true"`
 - `BE_NPM_TARGET` and `BE_NPM_TOKEN` are both set
+
+---
+
+## See also
+
+- [Setup beplus CLI](../cli/README.md)
+- [Setup beplus Provisioning](../provisioning/README.md)

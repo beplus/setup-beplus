@@ -20,7 +20,7 @@ Installs the beplus CLI (`@beplus/be` and `beplus`) with optional npm authentica
 Configures Git for secure operations using a GitHub App token.
 
 ```yaml
-- uses: beplus/setup-beplus/git@v1
+- uses: beplus/setup-beplus/git@v2
 ```
 ---
 
@@ -41,7 +41,7 @@ jobs:
         with:
           BE_CLI_VERSION: latest
 
-      - uses: beplus/setup-beplus/git@v1
+      - uses: beplus/setup-beplus/git@v2
 
       - run: beplus --version
 ```
