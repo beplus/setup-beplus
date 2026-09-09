@@ -1,0 +1,359 @@
+# The library repositories' PR check, once.
+# ------------------------------------------
+# Thirteen `beplus/*` repositories carried a copy of this file — 2,208 lines that
+# differed, in eight of them, by ONE LINE: the package list. The other five had
+# drifted into supersets and subsets of each other. This is the superset (the
+# version `beplus/ai` and `beplus/data` had reached), with the differences
+# expressed as inputs.
+#
+# Nothing here is new behaviour. Every step body below is byte-identical to the
+# one it replaces; what changed is the header and the four places a repository
+# name or a package list used to be written out.
+#
+#   uses: beplus/setup-beplus/.github/workflows/library-ci.yml@v2
+#   with:
+#     packages: |
+#       packages/core/docs
+#
+# See cli_v2 EXTRACTION-PLAN.md, slice R2-1.
+
+name: Library CI
+
+on:
+  workflow_call:
+    inputs:
+      packages:
+        description: "Newline-separated package directories this repo publishes (BE_PACKAGES)."
+        required: true
+        type: string
+      node-version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "22.14"
+      versioning-checks:
+        description: >-
+          Run the versioning dry-run, the version-policy consistency check and the
+          versioning PR comment. `beplus/ai`, `beplus/data` and `beplus/analytics`
+          had these; the other ten did not.
+        required: false
+        type: boolean
+        default: false
+      change-file-check:
+        description: >-
+          Detect package changes and require a Rush change file on a PR that has
+          them. Every repository but `beplus/uix` did this; uix opts out rather
+          than being handed a check it has never passed.
+        required: false
+        type: boolean
+        default: true
+      bundle-size-check:
+        description: "Report the built bundle size on the PR."
+        required: false
+        type: boolean
+        default: true
+      configure-git:
+        description: >-
+          Configure git with the release GitHub App token. Only `beplus/ai`,
+          `beplus/data` and `beplus/analytics` did this, and it needs
+          BE_RELEASE_GITHUB_APP_ID / _PRIVATE_KEY — which not every repository
+          has. Defaults off so adopting this workflow changes nothing.
+        required: false
+        type: boolean
+        default: false
+      cache:
+        description: >-
+          Cache Rush and the pnpm store. A pure speed-up, and safe to turn on
+          anywhere — but off by default, because R2-1 is a deduplication and a
+          faster CI is a separate, visible decision.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  validate:
+    name: Validate Changes
+    runs-on: ubuntu-latest
+
+    environment: ${{ github.base_ref }}
+
+    env:
+      BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
+      BE_PACKAGES: ${{ inputs.packages }}
+
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        if: inputs.configure-git
+        uses: beplus/setup-beplus/git@v2
+        with:
+          BE_RELEASE_GITHUB_APP_ID: ${{ secrets.BE_RELEASE_GITHUB_APP_ID }}
+          BE_RELEASE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.BE_RELEASE_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Cache Rush and pnpm
+        if: inputs.cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ runner.os }}-rush-${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
+          restore-keys: |
+            ${{ runner.os }}-rush-
+
+      - uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: latest
+          BE_NPM_AUTH: true
+
+      - name: Install the Dependencies
+        run: node ./common/scripts/install-run-rush.js install
+
+      - name: Check for package changes
+        if: inputs.change-file-check
+        id: package-changes
+        run: |
+          HAS_PACKAGE_CHANGES=false
+          HAS_CHANGE_FILES=false
+
+          # Check for changes in packages directory
+          if git diff origin/${{ github.base_ref }}...HEAD --name-only | grep -q "^packages/"; then
+            HAS_PACKAGE_CHANGES=true
+            echo "📦 Package code changes detected"
+          fi
+
+          # Check for unprocessed change files (from failed merges, manual creation, etc.)
+          if [ -d "common/changes" ] && [ "$(find common/changes -name "*.json" -type f | wc -l)" -gt 0 ]; then
+            HAS_CHANGE_FILES=true
+            echo "📄 Unprocessed change files detected"
+            find common/changes -name "*.json" -type f | head -5 | while read file; do
+              echo "  - $(basename "$file")"
+            done
+          fi
+
+          # Set output based on either condition
+          if [ "$HAS_PACKAGE_CHANGES" = "true" ] || [ "$HAS_CHANGE_FILES" = "true" ]; then
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "✅ Changes detected"
+          else
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No package changes or change files detected"
+          fi
+
+      - name: Verify change files (on PR with package changes)
+        if: inputs.change-file-check && (github.event_name == 'pull_request' && steps.package-changes.outputs.has-changes == 'true')
+        run: |
+          echo "Checking for change files..."
+          node ./common/scripts/install-run-rush.js change --verify --target-branch origin/dev
+
+      - name: Build packages
+        run: node ./common/scripts/install-run-rush.js rebuild --verbose
+
+      - name: Run tests (when available)
+        run: |
+          # Add this when you have tests
+          # node ./common/scripts/install-run-rush.js test --verbose
+          echo "Tests will be added in the future"
+
+      - name: Check bundle size
+        if: inputs.bundle-size-check
+        run: |
+          echo "### Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Package Sizes**:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          while IFS= read -r package; do
+            if [ -d "$package/dist" ]; then
+              PACKAGE_SIZE=$(du -sh "$package/dist" | cut -f1)
+              PACKAGE_NAME=$(basename "$package")
+              echo "📦 $PACKAGE_NAME: $PACKAGE_SIZE"
+              echo "- \`$PACKAGE_NAME\`: \`$PACKAGE_SIZE\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          done <<< "$BE_PACKAGES"
+
+      - name: Versioning dry run check
+        if: inputs.versioning-checks && (github.event_name == 'pull_request' && steps.package-changes.outputs.has-changes == 'true')
+        run: |
+          echo "🔍 Performing versioning dry run check..."
+
+          # Test if versioning would work without overriding user choices
+          if node ./common/scripts/install-run-rush.js version --bump 2>&1 | tee version-check.log; then
+            echo "✅ Versioning check passed - Rush can process change files correctly"
+
+            # Show what would happen
+            echo "📋 Versioning preview:"
+            grep -E "(bump|version|@beplus)" version-check.log || echo "No version changes anticipated"
+          else
+            echo "❌ Versioning check failed - there are issues with change files or version policies"
+            echo "Error details:"
+            cat version-check.log
+            exit 1
+          fi
+
+          # Reset any changes made by the dry run
+          git checkout -- . 2>/dev/null || true
+          git clean -fd 2>/dev/null || true
+
+      - name: Validate version policy consistency
+        if: inputs.versioning-checks && (steps.package-changes.outputs.has-changes == 'true')
+        run: |
+          echo "🔍 Checking version policy configuration..."
+
+          # Extract and validate version policies
+          node -e "
+            const fs = require('fs');
+            const rush = JSON.parse(fs.readFileSync('rush.json', 'utf8'));
+            const policiesUsed = new Set();
+
+            rush.projects.forEach(project => {
+              if (project.versionPolicyName) {
+                policiesUsed.add(project.versionPolicyName);
+              }
+            });
+
+            console.log('📋 Version policies in use:');
+            [...policiesUsed].forEach(policy => {
+              const packagesUsingPolicy = rush.projects.filter(p => p.versionPolicyName === policy);
+              console.log(\`  - \${policy}: \${packagesUsingPolicy.length} packages\`);
+              packagesUsingPolicy.forEach(p => console.log(\`    * \${p.packageName}\`));
+            });
+
+            // Check for undefined policies - read file and strip comments
+            let versionPoliciesContent = fs.readFileSync('common/config/rush/version-policies.json', 'utf8');
+
+            const versionPolicies = JSON.parse(versionPoliciesContent);
+            const definedPolicies = new Set(versionPolicies.map(vp => vp.policyName));
+
+            const undefinedPolicies = [...policiesUsed].filter(policy => !definedPolicies.has(policy));
+            if (undefinedPolicies.length > 0) {
+              console.error('❌ Undefined version policies found:', undefinedPolicies);
+              process.exit(1);
+            }
+
+            console.log('✅ All version policies are properly defined');
+          "
+
+      - name: Comment PR with build info
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Get build sizes for all packages
+            const { execSync } = require('child_process');
+            const packagesEnv = process.env.BE_PACKAGES;
+            const packages = packagesEnv.trim().split('\n').filter(p => p.trim());
+
+            let packageSizesMarkdown = '';
+            packages.forEach(packagePath => {
+              const distPath = `${packagePath}/dist`;
+              try {
+                const size = execSync(`du -sh ${distPath}`).toString().split('\t')[0];
+                const packageName = path.basename(packagePath);
+                packageSizesMarkdown += `- **${packageName}**: \`${size}\`\n`;
+              } catch (e) {
+                // dist folder doesn't exist, skip
+              }
+            });
+
+            const comment = `## 🚀 Build Summary
+
+            ✅ Build completed successfully!
+
+            ### Package Sizes
+            ${packageSizesMarkdown}
+            ---
+
+            Ready for review and merge!`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Comment PR with versioning info
+        if: inputs.versioning-checks && (github.event_name == 'pull_request' && steps.package-changes.outputs.has-changes == 'true')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let versioningInfo = '\n## 🏷️ Versioning Check\n\n';
+
+            // Read change files information
+            const commonChanges = 'common/changes';
+            if (fs.existsSync(commonChanges)) {
+              const { execSync } = require('child_process');
+              try {
+                const changeFiles = execSync(`find ${commonChanges} -name "*.json" -type f`).toString().trim().split('\n').filter(f => f);
+
+                if (changeFiles.length > 0) {
+                  versioningInfo += '### 📄 Change Files:\n';
+                  changeFiles.forEach(file => {
+                    if (file && fs.existsSync(file)) {
+                      try {
+                        const change = JSON.parse(fs.readFileSync(file, 'utf8'));
+                        change.changes.forEach(c => {
+                          versioningInfo += `- **${c.packageName}**: \`${c.type}\` - "${c.comment}"\n`;
+                        });
+                      } catch (e) {
+                        versioningInfo += `- ${file}: (parse error)\n`;
+                      }
+                    }
+                  });
+                } else {
+                  versioningInfo += '### ⚠️ No change files found \\n\\n**Action needed**: Run `rush change` to describe your changes.\n';
+                }
+
+                versioningInfo += '\n✅ **Result**: Ready for merge and publish!';
+
+              } catch (error) {
+                versioningInfo += `\n❌ **Error**: ${error.message}`;
+              }
+            }
+
+            // Update the previous comment instead of creating a new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' && comment.body.includes('🚀 Build Summary')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: botComment.body + versioningInfo
+              });
+            }

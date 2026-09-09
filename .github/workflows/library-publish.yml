@@ -1,0 +1,395 @@
+# The library repositories' publish pipeline, once.
+# -------------------------------------------------
+# Thirteen `beplus/*` repositories carried a copy of this file — 4,628 lines whose
+# real differences were four: the package list, the `rush publish --to` list, the
+# OIDC role name (always `github-actions-beplus-<repo>-<ref>-npm-publishing`, so
+# it is derived here rather than passed), and whether the force-mode change-file
+# step was live or commented out.
+#
+# ⚠️ THAT LAST ONE IS A 6/6 SPLIT AND IS NOT RESOLVED HERE. `beplus/server`
+# commented it out with "seems like with versioning policy set to lockStepVersion
+# this should NOT be here"; six repositories agreed and six did not. So it is an
+# input with NO default: every caller states what it does today, behaviour is
+# preserved exactly, and the question becomes visible instead of being decided by
+# whichever copy this file was cut from.
+#
+# Every step body below is byte-identical to the one it replaces.
+#
+#   uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
+#   with:
+#     packages: |
+#       packages/core/docs
+#     publish-to: "--to @beplus/docs"
+#     force-change-files: true
+#   secrets: inherit
+#
+# See cli_v2 EXTRACTION-PLAN.md, slice R2-1.
+
+name: Library Publish
+
+on:
+  workflow_call:
+    inputs:
+      packages:
+        description: "Newline-separated package directories this repo publishes (BE_PACKAGES)."
+        required: true
+        type: string
+      publish-to:
+        description: "The `rush publish` package selectors, `--to` included, e.g. \"--to @beplus/docs\"."
+        required: true
+        type: string
+      force-change-files:
+        description: >-
+          On a forced publish, write a Rush change file per package before
+          versioning. Six repositories did this and six had it commented out —
+          state what yours does today; see the warning at the top of this file.
+        required: true
+        type: boolean
+      bump-type:
+        description: "Bump type, passed through from the caller's workflow_dispatch."
+        required: false
+        type: string
+        default: "none"
+      force:
+        description: "Force mode, passed through from the caller's workflow_dispatch."
+        required: false
+        type: boolean
+        default: false
+      node-version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "22.14"
+      aws-region:
+        description: "AWS region for the OIDC role."
+        required: false
+        type: string
+        default: "us-east-1"
+
+# Required for AWS OIDC authentication and GitHub Packages publishing
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  packages: write
+
+env:
+  AWS_REGION: ${{ inputs.aws-region }}
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+
+    environment: ${{ github.ref_name }}
+
+    env:
+      BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
+      BE_PACKAGES: ${{ inputs.packages }}
+
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        uses: beplus/setup-beplus/git@v2
+        with:
+          BE_RELEASE_GITHUB_APP_ID: ${{ secrets.BE_RELEASE_GITHUB_APP_ID }}
+          BE_RELEASE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.BE_RELEASE_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Cache Rush and pnpm
+        uses: actions/cache@v4
+        with:
+          path: |
+            common/temp
+            ~/.rush
+            ~/.pnpm-store
+          key: ${{ runner.os }}-rush-${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
+          restore-keys: |
+            ${{ runner.os }}-rush-
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-beplus-${{ github.event.repository.name }}-${{ github.ref_name }}-npm-publishing
+          aws-region: us-east-1
+
+      - run: aws sts get-caller-identity
+
+      - uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: latest
+          BE_NPM_AUTH: true
+
+      - name: Install the Dependencies
+        run: node ./common/scripts/install-run-rush.js install
+
+      - name: Authenticate with AWS CodeArtifact
+        run: |
+          beplus i aws codeartifact auth
+
+      - name: Build packages
+        run: |
+          node ./common/scripts/install-run-rush.js rebuild \
+            ${{ inputs.publish-to }} \
+            --verbose
+
+      - name: Check for changes (Rush Change)
+        id: rush-change
+        run: |
+          # In "force" mode, skip change verification
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "🐛 FORCE MODE: Skipping change verification"
+          elif [ -d "common/changes" ] && [ "$(ls -A common/changes)" ]; then
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "✅ Change files detected"
+          else
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No change files found"
+          fi
+
+      - name: Create a change file for forced mode
+        if: inputs.force && inputs.force-change-files
+        run: |
+          mkdir -p common/changes
+          BUMP_TYPE="${{ inputs.bump-type }}"
+          [ "$BUMP_TYPE" = "none" ] && BUMP_TYPE="patch"
+
+          # Create a change file for each package
+          COUNTER=0
+          while IFS= read -r package; do
+            [ -z "$package" ] && continue
+            COUNTER=$((COUNTER + 1))
+            # Extract package name from path (e.g., docs-core from packages/core/docs-core)
+            PACKAGE_NAME=$(basename "$package")
+            # Convert to scoped package name (e.g., @beplus/docs-core)
+            SCOPED_NAME="@beplus/$PACKAGE_NAME"
+
+            cat > "common/changes/force-bump-$COUNTER.json" << EOF
+          {
+            "changes": [
+              {
+                "packageName": "$SCOPED_NAME",
+                "comment": "Forced release",
+                "type": "$BUMP_TYPE"
+              }
+            ],
+            "packageName": "$SCOPED_NAME"
+          }
+          EOF
+            echo "✅ Created change file for $SCOPED_NAME (type: $BUMP_TYPE)"
+          done <<< "$BE_PACKAGES"
+
+      - name: Version packages (Rush)
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          node ./common/scripts/install-run-rush.js version --bump --override-bump ${{ inputs.bump-type || 'patch' }}
+
+      - name: Prepare packages
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          PACKAGES_DIR="${GITHUB_WORKSPACE}/.packages"
+          rm -rf "$PACKAGES_DIR"
+          mkdir -p "$PACKAGES_DIR"
+
+          echo "BE_PACKAGES_DIR=$PACKAGES_DIR" >> "$GITHUB_ENV"
+          echo "Packages dir: $PACKAGES_DIR"
+
+          node ./common/scripts/install-run-rush.js publish \
+            --pack \
+            --include-all \
+            --publish \
+            --release-folder "$PACKAGES_DIR"
+
+      - name: Publish to CodeArtifact
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          for file in "$BE_PACKAGES_DIR"/*.tgz; do
+            [ -f "$file" ] || continue
+            echo "Publishing $file"
+            npm publish "$file"
+          done
+
+      - name: Publish to GitHub Packages
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          # Configure npm for GitHub Packages
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > ~/.npmrc-github
+          echo "@beplus:registry=https://npm.pkg.github.com" >> ~/.npmrc-github
+
+          for file in "$BE_PACKAGES_DIR"/*.tgz; do
+            [ -f "$file" ] || continue
+            echo "Publishing $file to GitHub Packages"
+            npm publish "$file" --userconfig ~/.npmrc-github
+          done
+
+      - name: Commit version changes
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          git add .
+          git commit -m "chore: publish packages [skip ci]"
+
+      - name: Create git tags from CHANGELOGs
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          # Find CHANGELOG.json files that were modified by rush version
+          git diff HEAD~1 --name-only | grep "CHANGELOG.json$" | while read changelog; do
+            if [ -f "$changelog" ]; then
+              tag=$(jq -r '.entries[0].tag // empty' "$changelog")
+              if [ -n "$tag" ]; then
+                echo "Creating tag: $tag"
+                git tag -a "$tag" -m "$tag"
+              fi
+            fi
+          done
+
+      - name: Push version changes
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          git push origin dev --follow-tags
+
+      - name: Create GitHub releases with artifacts
+        if: steps.rush-change.outputs.has-changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { execSync } = require('child_process');
+
+            // Find all CHANGELOG.json files that were modified
+            const changelogs = execSync('git diff HEAD~1 --name-only')
+              .toString()
+              .split('\n')
+              .filter(f => f.includes('CHANGELOG.json') && f);
+
+            for (const changelog of changelogs) {
+              if (fs.existsSync(changelog)) {
+                const data = JSON.parse(fs.readFileSync(changelog, 'utf8'));
+                const tag = data.entries[0]?.tag;
+
+                if (tag) {
+                  const comments = data.entries[0]?.comments || {};
+                  const releaseNotes = Object.values(comments)
+                    .flat()
+                    .map(c => c.comment)
+                    .join('\n') || 'Release notes not available';
+
+                  try {
+                    const release = await github.rest.repos.createRelease({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      tag_name: tag,
+                      body: releaseNotes,
+                      draft: false,
+                      prerelease: false
+                    });
+
+                    // Extract package name and version from tag (e.g., @beplus/auth_v0.10.0)
+                    const tagMatch = tag.match(/^@?[\w-]+\/?([\w-]+)_v(.+)$/);
+                    core.info(`Tag: ${tag}, Match: ${JSON.stringify(tagMatch)}`);
+
+                    if (tagMatch) {
+                      const packageName = tagMatch[1];
+                      const version = tagMatch[2];
+                      core.info(`Looking for artifact: packageName=${packageName}, version=${version}`);
+
+                      // Search for matching tgz file in "$BE_PACKAGES_DIR"
+                      const artifactsDir = process.env.BE_PACKAGES_DIR;
+                      core.info(`Artifacts directory: ${artifactsDir}`);
+
+                      if (fs.existsSync(artifactsDir)) {
+                        const files = fs.readdirSync(artifactsDir);
+                        core.info(`Files in artifacts dir: ${JSON.stringify(files)}`);
+
+                        const tgzFile = files.find(f =>
+                          f.includes(packageName) && f.includes(version) && f.endsWith('.tgz')
+                        );
+                        core.info(`Matching tgz file: ${tgzFile || 'NOT FOUND'}`);
+
+                        if (tgzFile) {
+                          const tgzPath = path.join(artifactsDir, tgzFile);
+                          core.info(`Uploading: ${tgzPath}`);
+
+                          await github.rest.repos.uploadReleaseAsset({
+                            owner: context.repo.owner,
+                            repo: context.repo.repo,
+                            release_id: release.data.id,
+                            name: tgzFile,
+                            data: fs.readFileSync(tgzPath)
+                          });
+                          core.info(`Uploaded artifact: ${tgzFile}`);
+                        } else {
+                          core.warning(`No matching tgz file found for ${packageName}@${version}`);
+                        }
+                      } else {
+                        core.warning(`Artifacts directory does not exist: ${artifactsDir}`);
+                      }
+                    } else {
+                      core.warning(`Could not parse tag: ${tag}`);
+                    }
+
+                    core.info(`Created release for ${tag}`);
+                  } catch (error) {
+                    core.warning(`Could not create release for ${tag}: ${error.message}`);
+                  }
+                }
+              }
+            }
+
+      - name: Create release notes
+        if: steps.rush-change.outputs.has-changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Parse packages from environment variable
+            const packagesEnv = process.env.BE_PACKAGES;
+            const packages = packagesEnv.trim().split('\n').filter(p => p.trim());
+
+            let allReleaseNotes = '## Release Notes\n\n';
+            let summary = '';
+
+            for (const packagePath of packages) {
+              const packageName = path.basename(packagePath);
+              const scopedName = `@beplus/${packageName}`;
+              const changelogPath = path.join(process.cwd(), packagePath, 'CHANGELOG.md');
+              const packageJsonPath = path.join(process.cwd(), packagePath, 'package.json');
+
+              let packageReleaseNotes = '';
+              let version = 'unknown';
+
+              if (fs.existsSync(changelogPath)) {
+                const changelog = fs.readFileSync(changelogPath, 'utf8');
+                const latestEntry = changelog.split('\n## ')[1];
+                if (latestEntry) {
+                  packageReleaseNotes = latestEntry;
+                }
+              }
+
+              if (fs.existsSync(packageJsonPath)) {
+                const packageJson = require(packageJsonPath);
+                version = packageJson.version;
+              }
+
+              allReleaseNotes += `### ${scopedName}@${version}\n\n${packageReleaseNotes}\n\n`;
+              summary += `- **${scopedName}@${version}**\n`;
+            }
+
+            core.info(`Published all packages`);
+            core.summary
+              .addHeading('📦 Published Packages')
+              .addRaw(summary)
+              .addHeading('📝 Release Notes')
+              .addRaw(allReleaseNotes)
+              .write();
