@@ -1,0 +1,344 @@
+# One `cdk diff` / `cdk deploy` job, once.
+# ---------------------------------------
+# Three estates carried a copy of this composite action — 967 lines that differed
+# by a handful of comments. It was already fully parameterised, which is what
+# made it the one part of `infra.yml` that could move: the workflows themselves
+# stay put, because a reusable workflow cannot express a job DAG whose shape
+# comes from a manifest (see the note in EXTRACTION-PLAN.md, R2-3).
+#
+#   - uses: beplus/setup-beplus/cdk-package@v2
+#     with:
+#       package: apps
+#       env: dev
+#       mode: diff
+#
+# Every step below is byte-identical to the copy it replaces.
+#
+name: cdk-package
+description: >-
+  Build one of the six packages/aws CDK apps and run `cdk diff`, `cdk deploy` or
+  `cdk destroy` against one environment, through a GitHub OIDC role.
+
+# ┌─ WHAT THIS IS FOR ────────────────────────────────────────────────────────┐
+# │ Every one of the six CDK apps needs the same eight things done to it       │
+# │ before `cdk` can say anything useful: node 22.14, an authenticated @beplus  │
+# │ scope, a Rush install scoped to that package, a Rush build, AWS credentials │
+# │ from OIDC, the pinned CDK CLI, BE_ENVIRONMENT, and a stack selector that    │
+# │ addresses the stacks INSIDE a cdk.Stage rather than `--all`, which does not │
+# │ look in a nested assembly.                                                  │
+# │                                                                            │
+# │ Copied into two workflows and six matrix legs, that is twelve places to     │
+# │ get the npm auth or the selector wrong. Here it is one.                     │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
+# ⚠️ SAFETY, AND WHERE IT ACTUALLY LIVES. Nothing in this action decides whether
+# a deploy is allowed — it does what `mode` says. Three things stop `deploy` from
+# happening by accident, and none of them is in this file:
+#
+#   1. The AWS role. `…-cdk-diff` cannot assume any bootstrap role but `lookup`,
+#      so a pull request holding those credentials CANNOT deploy, whatever it
+#      asks this action for.
+#   2. `infra.yml` gates every deploy job on the per-environment repository
+#      variable `BE_INFRA_DEPLOY_ENABLED == 'true'`, which does not exist until
+#      somebody creates it.
+#   3. GitHub Environments — `environment:` on the job — which do not exist
+#      until somebody creates them either.
+#
+# What IS here is the one refusal that belongs next to the command: `destroy` is
+# rejected for anything but `dev`, and for `shared` and `main` at all.
+
+inputs:
+  package:
+    description: One of the `package` values in packages.json (shared, main, base, data, apps, apps-routing).
+    required: true
+  env:
+    description: dev | stage | prod | shared
+    required: true
+  mode:
+    description: diff | deploy | destroy
+    required: false
+    default: diff
+  stacks:
+    description: >-
+      Stack selector(s), space-separated. Defaults to the package's `diffStacks`
+      or `deployStacks` from packages.json. Selectors that match nothing in this
+      synth are dropped — several stacks here are conditional on config.
+    required: false
+    default: ""
+  extra-args:
+    description: Appended to the cdk command verbatim (e.g. `--exclusively`).
+    required: false
+    default: ""
+  role-arn:
+    description: The IAM role to assume via OIDC.
+    required: true
+  aws-region:
+    required: false
+    default: us-east-1
+  npm-token:
+    description: BE_NPM_TOKEN. A composite action cannot read `secrets`, so the caller passes it.
+    required: true
+  npm-target:
+    required: false
+    default: ""
+
+outputs:
+  diff-file:
+    description: Path to the captured `cdk diff` output (diff mode only).
+    value: ${{ steps.run.outputs.diff-file }}
+  has-changes:
+    description: "'true' when `cdk diff` reported at least one changed stack."
+    value: ${{ steps.run.outputs.has-changes }}
+  stacks:
+    description: The selectors that survived the prune, space-separated.
+    value: ${{ steps.resolve.outputs.stacks }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: 22.14
+
+    # @beplus/* lives on npm.beplus.cloud (routed by common/config/rush/.npmrc).
+    # Without the token pnpm still gets HTTP 200 from the proxy — with a stub
+    # body — and fails late and unhelpfully with ERR_PNPM_TARBALL_INTEGRITY.
+    - name: Authenticate the @beplus scope
+      uses: beplus/setup-beplus/cli@v2
+      env:
+        BE_NPM_TARGET: ${{ inputs.npm-target }}
+        BE_NPM_TOKEN: ${{ inputs.npm-token }}
+      with:
+        BE_CLI_VERSION: latest
+        BE_NPM_AUTH: true
+
+    - name: Resolve the package
+      id: resolve
+      shell: bash
+      env:
+        INPUT_PACKAGE: ${{ inputs.package }}
+        INPUT_ENV: ${{ inputs.env }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_STACKS: ${{ inputs.stacks }}
+        INPUT_EXTRA_ARGS: ${{ inputs.extra-args }}
+      run: |
+        set -euo pipefail
+        beplus infra resolve --githubOutput >> "$GITHUB_OUTPUT"
+
+    # Nothing above this line has AWS credentials, and the resolve step is where
+    # `destroy` is refused — so a refused destroy never even gets a token.
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: gha-${{ inputs.package }}-${{ inputs.mode }}
+
+    - name: Who am I
+      shell: bash
+      run: aws sts get-caller-identity
+
+    - name: Rush install
+      shell: bash
+      run: node common/scripts/install-run-rush.js install --to ${{ steps.resolve.outputs.rush-name }}
+
+    - name: Rush build
+      shell: bash
+      run: node common/scripts/install-run-rush.js build --to ${{ steps.resolve.outputs.rush-name }}
+
+    # Pinned, and pinned in ONE place: the root package.json devDependency, which
+    # `infra resolve` reads. `aws-cdk@^2` — what this replaced — resolves to
+    # whatever npm published this morning, so the CLI that deployed prod
+    # yesterday is not the CLI deploying it today.
+    - name: Install the pinned CDK CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        npm install --location=global "aws-cdk@${{ steps.resolve.outputs.cdk-version }}"
+        cdk --version
+
+    # Which stacks this app actually synthesizes. Several are conditional on
+    # config — the alerts stacks, the release-deploy role, the cost guardrails,
+    # each release pipeline — and `cdk deploy` on a selector that matches
+    # nothing fails the job with "No stacks match", which reads like a broken
+    # workflow rather than a stack that is off in this environment.
+    - name: Prune the selectors to what this synth contains
+      id: prune
+      shell: bash
+      working-directory: packages/aws/${{ inputs.package }}
+      env:
+        BE_ENVIRONMENT: ${{ inputs.env }}
+        SELECTORS: ${{ steps.resolve.outputs.stacks }}
+        ORDERED: ${{ steps.resolve.outputs.ordered }}
+        # Context a package needs just to synthesize (apps' console stack refuses
+        # to synth without an imageTag). Empty for every other package. Unquoted
+        # below so an empty value expands to nothing.
+        SYNTH_CONTEXT: ${{ steps.resolve.outputs.synth-context }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086
+        if cdk list --long ${SYNTH_CONTEXT:-} > /tmp/cdk-list.json 2> /tmp/cdk-list.err; then
+          beplus infra prune /tmp/cdk-list.json --githubOutput >> "$GITHUB_OUTPUT"
+        elif grep -q "This app contains no stacks" /tmp/cdk-list.err; then
+          # A legitimately empty stage — every stack in it is gated off in this
+          # environment. The CLI treats "nothing to list" as an error; it is
+          # not one here. Hand the run step an empty selector set: it passes a
+          # diff with a notice and still refuses to call a deploy of nothing a
+          # success. (Mountaineer's diff leg died in `cdk list` before the run
+          # step's empty-selector handling could say "nothing to diff".)
+          echo "stacks=" >> "$GITHUB_OUTPUT"
+          echo "ordered=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::cdk list failed for ${{ inputs.package }}/${{ inputs.env }}"
+          cat /tmp/cdk-list.err
+          exit 1
+        fi
+      # `cdk list` is a synth: it resolves the provisioning config out of this
+      # account, so it needs the credentials obtained above and proves they work
+      # before anything is changed.
+
+    - name: cdk ${{ inputs.mode }}
+      id: run
+      shell: bash
+      working-directory: packages/aws/${{ inputs.package }}
+      env:
+        BE_ENVIRONMENT: ${{ inputs.env }}
+        MODE: ${{ inputs.mode }}
+        SELECTORS: ${{ steps.prune.outputs.stacks }}
+        ORDERED: ${{ steps.prune.outputs.ordered }}
+        EXTRA_ARGS: ${{ steps.resolve.outputs.extra-args }}
+        # See the prune step: context apps needs just to synthesize its console
+        # stack. Empty elsewhere; unquoted at each use so empty expands to nothing.
+        SYNTH_CONTEXT: ${{ steps.resolve.outputs.synth-context }}
+        PACKAGE: ${{ inputs.package }}
+        TARGET_ENV: ${{ inputs.env }}
+      run: |
+        set -euo pipefail
+
+        # ⚠️ EVERY SELECTOR PRUNED IS NOT "NOTHING TO DO" ON A DEPLOY.
+        # It is the shape a `cdk list` parsing bug takes: the deploy skips
+        # every stack and reports success. A diff may legitimately come back
+        # empty (an environment with every conditional stack switched off); a
+        # deploy that was asked to change something and matched nothing is a
+        # failure, and it says so.
+        if [ -z "${SELECTORS// }" ]; then
+          if [ "$MODE" = "diff" ]; then
+            echo "::notice::${PACKAGE}/${TARGET_ENV} synthesizes none of its declared stacks — nothing to diff."
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::${PACKAGE}/${TARGET_ENV}: none of the declared stacks matched this synth. Either every one of them is conditional and switched off in this environment, or the selectors are wrong. Refusing to report a deploy that changed nothing as a success."
+          exit 1
+        fi
+
+        out="${RUNNER_TEMP}/cdk-${PACKAGE}-${TARGET_ENV}.${MODE}.txt"
+        : > "$out"
+
+        # shellcheck disable=SC2086
+        case "$MODE" in
+          diff)
+            # One invocation: a diff is a report, and reading six of them per
+            # package is worse than reading one.
+            set +e
+            cdk diff $SELECTORS $EXTRA_ARGS ${SYNTH_CONTEXT:-} 2>&1 | tee -a "$out"
+            status=${PIPESTATUS[0]}
+            set -e
+            [ "$status" -eq 0 ] || { echo "::error::cdk diff exited $status"; exit "$status"; }
+            ;;
+          deploy)
+            if [ "$ORDERED" = "true" ]; then
+              # One selector at a time, in the declared order. CDK orders by its
+              # own dependency graph within a single invocation, which is not
+              # the same thing: BESharedVpcStackV1 depends on nothing, so
+              # nothing would put it first.
+              for selector in $SELECTORS; do
+                echo "::group::cdk deploy $selector"
+                cdk deploy "$selector" $EXTRA_ARGS ${SYNTH_CONTEXT:-} --require-approval never 2>&1 | tee -a "$out"
+                echo "::endgroup::"
+              done
+            else
+              cdk deploy $SELECTORS $EXTRA_ARGS ${SYNTH_CONTEXT:-} --require-approval never 2>&1 | tee -a "$out"
+            fi
+            ;;
+          destroy)
+            # Reverse of the deploy order: a dependency is torn down after the
+            # thing that depends on it.
+            reversed=$(echo "$SELECTORS" | tr ' ' '\n' | tac | tr '\n' ' ')
+            for selector in $reversed; do
+              echo "::group::cdk destroy $selector"
+              cdk destroy "$selector" $EXTRA_ARGS ${SYNTH_CONTEXT:-} --force 2>&1 | tee -a "$out"
+              echo "::endgroup::"
+            done
+            ;;
+          *)
+            echo "::error::unknown mode \"$MODE\""; exit 1 ;;
+        esac
+
+        echo "diff-file=$out" >> "$GITHUB_OUTPUT"
+        if grep -qE '^(Stack |Resources$|\[[-+~]\])' "$out"; then
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-changes=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Wave 3 adds cdk-nag to the package tests and writes its report here. Until
+    # then this is a no-op — declared now so the report appears in the diff the
+    # day it exists, rather than in a file nobody opens.
+    - name: Attach the cdk-nag report, if the package produced one
+      if: always()
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+      run: |
+        set -euo pipefail
+        report="packages/aws/${PACKAGE}/cdk-nag.md"
+        [ -f "$report" ] || exit 0
+        cp "$report" "${RUNNER_TEMP}/cdk-nag-${PACKAGE}.md"
+        echo "CDK_NAG_REPORT=${RUNNER_TEMP}/cdk-nag-${PACKAGE}.md" >> "$GITHUB_ENV"
+
+    - name: Summarise
+      if: always()
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        TARGET_ENV: ${{ inputs.env }}
+        MODE: ${{ inputs.mode }}
+        DIFF_FILE: ${{ steps.run.outputs.diff-file }}
+      run: |
+        set -euo pipefail
+        {
+          echo "### \`${PACKAGE}\` · \`${TARGET_ENV}\` · ${MODE}"
+          echo
+          if [ -n "${DIFF_FILE:-}" ] && [ -f "$DIFF_FILE" ]; then
+            echo '<details><summary>cdk '"${MODE}"' output</summary>'
+            echo
+            echo '```diff'
+            # A whole `apps` diff can exceed the 1 MiB step-summary limit, which
+            # fails the write rather than truncating it.
+            head -c 900000 "$DIFF_FILE"
+            echo
+            echo '```'
+            echo '</details>'
+          else
+            echo "_no output captured_"
+          fi
+          if [ -n "${CDK_NAG_REPORT:-}" ] && [ -f "${CDK_NAG_REPORT}" ]; then
+            echo
+            echo '<details><summary>cdk-nag</summary>'
+            echo
+            cat "${CDK_NAG_REPORT}"
+            echo '</details>'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload the output
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cdk-${{ inputs.mode }}-${{ inputs.package }}-${{ inputs.env }}
+        path: |
+          ${{ steps.run.outputs.diff-file }}
+          ${{ env.CDK_NAG_REPORT }}
+        if-no-files-found: ignore
+        retention-days: 14
