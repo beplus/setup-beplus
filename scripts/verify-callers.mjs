@@ -6,8 +6,8 @@
  * that resolving the shared workflow WITH EACH CALLER'S INPUTS yields the same
  * enabled steps, in the same order, as the file that caller replaced.
  *
- * The originals come from git (HEAD~1), so this keeps working as a regression
- * check for exactly one commit — which is the commit that matters.
+ * The originals come from git — `HEAD~1` by default, or $BEFORE_REF — so this
+ * keeps working as a regression check across the commit that matters.
  *
  * Usage:  node scripts/verify-callers.mjs <path to the beplus org checkout>
  *         e.g. node scripts/verify-callers.mjs ~/Git/github.com/beplus
@@ -72,7 +72,7 @@ for (const repo of REPOS) {
   for (const [file, workflow] of [['ci', 'library-ci'], ['publish', 'library-publish']]) {
     const path = `.github/workflows/${file}.yml`;
     const before = YAML.parse(
-      execFileSync('git', ['-C', join(ORG, repo), 'show', `HEAD:${path}`], { encoding: 'utf8', maxBuffer: 1e8 }),
+      execFileSync('git', ['-C', join(ORG, repo), 'show', `${process.env.BEFORE_REF ?? 'HEAD~1'}:${path}`], { encoding: 'utf8', maxBuffer: 1e8 }),
     );
     const caller = YAML.parse(readFileSync(join(ORG, repo, path), 'utf8'));
 
