@@ -22,6 +22,41 @@ Configures Git for secure operations using a GitHub App token.
 ```yaml
 - uses: beplus/setup-beplus/git@v2
 ```
+### Reusable workflows
+
+The thirteen `beplus/*` library repositories each carried a copy of the same PR
+check and the same publish pipeline — 6,836 lines that differed, in most of them,
+by the package list alone. Both now live here once:
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  validate:
+    uses: beplus/setup-beplus/.github/workflows/library-ci.yml@v2
+    secrets: inherit
+    with:
+      packages: |
+        packages/core/docs
+```
+
+```yaml
+# .github/workflows/publish.yml — keep your own triggers, share the pipeline
+jobs:
+  publish:
+    uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
+    secrets: inherit
+    with:
+      packages: |
+        packages/core/docs
+      publish-to: "--to @beplus/docs"
+      force-change-files: true
+```
+
+Every optional step is an input that defaults to OFF, so adopting these changes
+nothing: a repository states what it already did. `scripts/verify-callers.mjs`
+checks that, resolving each caller against the shared workflow and comparing the
+enabled steps to the file it replaced.
+
 ---
 
 ## Quick Start

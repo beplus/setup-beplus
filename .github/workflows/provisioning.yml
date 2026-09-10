@@ -1,0 +1,66 @@
+# `beplus provisioning update`, once.
+# -----------------------------------
+# Four repositories carried a copy of this — 158 lines whose real differences
+# were the branches it may run on and whether the mobile plugin is enabled. It is
+# short enough that duplicating it looked harmless, which is exactly how four
+# copies happen.
+#
+#   uses: beplus/setup-beplus/.github/workflows/provisioning.yml@v2
+#   with:
+#     branches: '["dev","prod"]'
+#   secrets: inherit
+#
+# See cli_v2 EXTRACTION-PLAN.md, slice R2-2.
+
+name: beplus Provisioning
+
+on:
+  workflow_call:
+    inputs:
+      branches:
+        description: >-
+          JSON array of branches this may run on. ⚠️ THE GUARD, not a preference:
+          provisioning writes to a real account, and `workflow_dispatch` offers
+          every branch in the picker.
+        required: true
+        type: string
+      node-version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "22.14"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  update-provisioning:
+    # Block any random branch. `contains` on a JSON array rather than a string
+    # match: `startsWith('dev')` would also admit `dev-experiment`.
+    if: contains(fromJSON(inputs.branches), github.ref_name)
+
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    env:
+      BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: latest
+          BE_NPM_AUTH: true
+
+      - uses: beplus/setup-beplus/provisioning@v2
+        with:
+          BE_AWS_ACCOUNT_ID: ${{ vars.BE_AWS_ACCOUNT_ID }}
+          BE_PROVISIONING_PLUGIN_MOBILE_ENABLED: ${{ vars.BE_PROVISIONING_PLUGIN_MOBILE_ENABLED }}
