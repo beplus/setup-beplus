@@ -122,7 +122,7 @@ jobs:
           BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
           BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
         with:
-          BE_CLI_VERSION: latest
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION || 'latest' }}
           BE_NPM_AUTH: true
 
       - name: Install the Dependencies

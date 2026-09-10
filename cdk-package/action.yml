@@ -75,6 +75,14 @@ inputs:
   aws-region:
     required: false
     default: us-east-1
+  cli-version:
+    description: >-
+      Which beplus CLI to install. ⚠️ `latest` resolves to the newest FULL
+      release, which today is v1 — and the resolve/prune steps below call
+      `beplus infra`, which only exists in v2. Callers on v2 must pass an
+      explicit version until a v2 release is tagged.
+    required: false
+    default: latest
   npm-token:
     description: BE_NPM_TOKEN. A composite action cannot read `secrets`, so the caller passes it.
     required: true
@@ -111,7 +119,7 @@ runs:
         BE_NPM_TARGET: ${{ inputs.npm-target }}
         BE_NPM_TOKEN: ${{ inputs.npm-token }}
       with:
-        BE_CLI_VERSION: latest
+        BE_CLI_VERSION: ${{ inputs.cli-version }}
         BE_NPM_AUTH: true
 
     - name: Resolve the package
