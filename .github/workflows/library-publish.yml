@@ -133,7 +133,14 @@ jobs:
 
       - name: Authenticate with AWS CodeArtifact
         run: |
-          beplus i aws codeartifact auth
+          # The environment decides which CodeArtifact domain/repository the
+          # token is minted for. The CLI silently falls back to "dev" when it
+          # is unset, which would quietly publish a main release into dev.
+          if [ -z "${BE_ENVIRONMENT}" ]; then
+            echo "::error::BE_ENVIRONMENT is empty - set the BE_ENVIRONMENT variable on the '${{ github.ref_name }}' GitHub environment."
+            exit 1
+          fi
+          beplus aws codeartifact auth --env "${BE_ENVIRONMENT}"
 
       - name: Build packages
         run: |
