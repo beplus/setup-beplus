@@ -1,0 +1,197 @@
+# A beplus docs site, built and published to GitHub Pages, once.
+# ---------------------------------------------------------------
+# beplus/uix (`portal.yml`) and beplus/cli_v2 (`docs.yml`) each carried the same pipeline for
+# their RR7 docs portals: ask Pages where the site lives, install, build, upload, deploy — and on a
+# pull request, build and stop. Both portals are now `@beplus/docs-site` (beplus/docs), so the
+# pipeline lives here, and a repository's docs workflow is a caller:
+#
+#   jobs:
+#     docs:
+#       uses: beplus/setup-beplus/.github/workflows/docs-pages.yml@v2
+#       permissions:
+#         contents: read
+#         pages: write
+#         id-token: write
+#       secrets: inherit
+#       with:
+#         working-directory: packages/sites/portal
+#         prebuild: node common/scripts/install-run-rush.js build --to @beplus/cli
+#         publish-branch: prod
+#
+# The site is built by the package's own `build` script (`beplus-docs build`), which checks the
+# bundle and fails on an unreachable page or a broken link before anything is published.
+#
+# The registry token: `@beplus/docs-site` draws with @beplus/uix and FontAwesome Pro, installed
+# from npm.beplus.cloud, so the install needs `BE_NPM_TOKEN`. It is read from the caller's secrets
+# (`secrets: inherit`), which reach this job only if it is a repository or organisation secret —
+# or an environment secret of the environment named in `environment`. It is both written to
+# ~/.npmrc and exported, so it works whichever way a repository's `.npmrc` expects it.
+
+name: Docs to GitHub Pages
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "The package holding docs.config.ts, relative to the repository root."
+        required: true
+        type: string
+      prebuild:
+        description: "A command run from the repository root after install and before the build — building what the site reads (a CLI, the workspace packages the site depends on)."
+        required: false
+        type: string
+        default: ""
+      test:
+        description: "A command run in the working directory before the build."
+        required: false
+        type: string
+        default: ""
+      build:
+        description: "The build command, run in the working directory."
+        required: false
+        type: string
+        default: "npm run build"
+      output:
+        description: "What the build writes for Pages to serve, relative to the working directory."
+        required: false
+        type: string
+        default: "build/client"
+      publish-branch:
+        description: "Publish only from this branch. Empty publishes from whatever the caller's triggers run on (never from a pull request)."
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "The environment the build job runs in, when BE_NPM_TOKEN is an environment secret (uix's is on `dev`)."
+        required: false
+        type: string
+        default: ""
+      node-version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "22.14"
+      title:
+        description: "What the step summary calls the site."
+        required: false
+        type: string
+        default: "Docs"
+
+permissions:
+  contents: read
+
+# One deployment at a time, and never cancel one half-done: a partly uploaded site is a broken one.
+# A pull request's build deploys nothing, so a newer push to it replaces the one in flight.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('docs-pages-{0}', github.ref) || format('docs-pages-{0}', github.repository) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build the docs site
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    # `pages: read` is for asking Pages where the site will be served, below.
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      publish: ${{ steps.publish.outputs.publish }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Decide whether this run publishes
+        id: publish
+        env:
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          ONLY: ${{ inputs.publish-branch }}
+        run: |
+          if [ "$EVENT" != "pull_request" ] && { [ -z "$ONLY" ] || [ "$BRANCH" = "$ONLY" ]; }; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Where the site will be served, asked of Pages rather than guessed. A private site is served
+      # from a unique subdomain of its own, at the root; a public project site from /<repository>/; a
+      # custom domain at the root. Every link and every asset the build writes starts with this path,
+      # so guessing wrong serves a page whose stylesheet, scripts and links all 404. A run that does
+      # not publish cannot ask, and builds at the root.
+      - name: Ask Pages where the site lives
+        id: pages
+        if: steps.publish.outputs.publish == 'true'
+        uses: actions/configure-pages@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Authenticate npm.beplus.cloud
+        env:
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        run: |
+          if [ -z "$BE_NPM_TOKEN" ]; then
+            echo "::error::BE_NPM_TOKEN is empty. Make it a repository secret, or name the environment that holds it (inputs.environment)."
+            exit 1
+          fi
+          echo "//npm.beplus.cloud/:_authToken=${BE_NPM_TOKEN}" >> ~/.npmrc
+
+      - name: Install dependencies
+        env:
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        run: node common/scripts/install-run-rush.js install
+
+      - name: Build what the site reads
+        if: inputs.prebuild != ''
+        run: ${{ inputs.prebuild }}
+
+      - name: Test
+        if: inputs.test != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.test }}
+
+      - name: Build the site
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          DOCS_BASE: ${{ steps.pages.outputs.base_path }}
+          DOCS_SITE_URL: ${{ steps.pages.outputs.base_url }}
+        run: ${{ inputs.build }}
+
+      - name: Summarise what was built
+        env:
+          OUT: ${{ inputs.working-directory }}/${{ inputs.output }}
+          SITE_URL: ${{ steps.pages.outputs.base_url }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          {
+            echo "### $TITLE"
+            echo
+            echo "- **Pages**: $(find "$OUT" -name index.html | wc -l)"
+            echo "- **Size**: $(du -sh "$OUT" | cut -f1)"
+            echo "- **Served at**: ${SITE_URL:-not published — this run builds at the root}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the site
+        if: steps.publish.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ inputs.working-directory }}/${{ inputs.output }}
+
+  deploy:
+    name: Publish to GitHub Pages
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    # Pages needs to write the deployment and to mint the token that proves it came from this run.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
