@@ -21,11 +21,12 @@
 # The site is built by the package's own `build` script (`beplus-docs build`), which checks the
 # bundle and fails on an unreachable page or a broken link before anything is published.
 #
-# The registry token: `@beplus/docs-site` draws with @beplus/uix and FontAwesome Pro, installed
-# from npm.beplus.cloud, so the install needs `BE_NPM_TOKEN`. It is read from the caller's secrets
-# (`secrets: inherit`), which reach this job only if it is a repository or organisation secret —
-# or an environment secret of the environment named in `environment`. It is both written to
-# ~/.npmrc and exported, so it works whichever way a repository's `.npmrc` expects it.
+# The registry: `@beplus/docs-site` draws with @beplus/uix and FontAwesome Pro, installed from
+# npm.beplus.cloud. The job authenticates it as every other shared workflow here does — the
+# `cli` action's `beplus npm auth`, from `BE_NPM_TARGET` and `BE_NPM_TOKEN` — which writes the
+# token and the scopes (`@beplus`, `@fortawesome`, …) to ~/.npmrc. `BE_NPM_TOKEN` is read from the
+# caller's secrets (`secrets: inherit`), which reach this job only if it is a repository or
+# organisation secret — or an environment secret of the environment named in `environment`.
 
 name: Docs to GitHub Pages
 
@@ -128,19 +129,15 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
 
-      - name: Authenticate npm.beplus.cloud
+      - uses: beplus/setup-beplus/cli@v2
         env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
           BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
-        run: |
-          if [ -z "$BE_NPM_TOKEN" ]; then
-            echo "::error::BE_NPM_TOKEN is empty. Make it a repository secret, or name the environment that holds it (inputs.environment)."
-            exit 1
-          fi
-          echo "//npm.beplus.cloud/:_authToken=${BE_NPM_TOKEN}" >> ~/.npmrc
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION || 'latest' }}
+          BE_NPM_AUTH: true
 
       - name: Install dependencies
-        env:
-          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
         run: node common/scripts/install-run-rush.js install
 
       - name: Build what the site reads
