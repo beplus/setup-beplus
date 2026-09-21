@@ -224,7 +224,20 @@ jobs:
           # Extract and validate version policies
           node -e "
             const fs = require('fs');
-            const rush = JSON.parse(fs.readFileSync('rush.json', 'utf8'));
+
+            // rush.json and version-policies.json are JSONC: Rush documents and accepts comments in
+            // both — rush init writes block comments throughout — and tolerates trailing commas, so a
+            // plain JSON.parse throws on any repo that uses either. A string is matched first and
+            // kept whole, so a URL inside a value (the schema keys) is never taken for a comment.
+            const readJsonc = (file) => {
+              const keepStrings = (match) => (match[0] === '\x22' ? match : '');
+              const text = fs.readFileSync(file, 'utf8')
+                .replace(/\x22(?:[^\x22\x5c]|\x5c.)*\x22|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, keepStrings)
+                .replace(/\x22(?:[^\x22\x5c]|\x5c.)*\x22|,(?=\s*[}\]])/g, keepStrings);
+              return JSON.parse(text);
+            };
+
+            const rush = readJsonc('rush.json');
             const policiesUsed = new Set();
 
             rush.projects.forEach(project => {
@@ -240,10 +253,8 @@ jobs:
               packagesUsingPolicy.forEach(p => console.log(\`    * \${p.packageName}\`));
             });
 
-            // Check for undefined policies - read file and strip comments
-            let versionPoliciesContent = fs.readFileSync('common/config/rush/version-policies.json', 'utf8');
-
-            const versionPolicies = JSON.parse(versionPoliciesContent);
+            // Check for undefined policies.
+            const versionPolicies = readJsonc('common/config/rush/version-policies.json');
             const definedPolicies = new Set(versionPolicies.map(vp => vp.policyName));
 
             const undefinedPolicies = [...policiesUsed].filter(policy => !definedPolicies.has(policy));
