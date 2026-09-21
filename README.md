@@ -57,6 +57,28 @@ nothing: a repository states what it already did. `scripts/verify-callers.mjs`
 checks that, resolving each caller against the shared workflow and comparing the
 enabled steps to the file it replaced.
 
+A repository's docs site — `@beplus/docs-site` from beplus/docs — is built and
+published to GitHub Pages by one more:
+
+```yaml
+# .github/workflows/docs.yml — keep your own triggers
+jobs:
+  docs:
+    uses: beplus/setup-beplus/.github/workflows/docs-pages.yml@v2
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    secrets: inherit
+    with:
+      working-directory: packages/sites/portal
+      prebuild: node common/scripts/install-run-rush.js build --to @beplus/cli
+      publish-branch: prod
+```
+
+It asks Pages where the site lives (`DOCS_BASE`, `DOCS_SITE_URL`), builds, and
+publishes on a push to `publish-branch`; a pull request builds and stops.
+
 ---
 
 ## Quick Start
