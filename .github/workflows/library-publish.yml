@@ -13,7 +13,8 @@
 # preserved exactly, and the question becomes visible instead of being decided by
 # whichever copy this file was cut from.
 #
-# Every step body below is byte-identical to the one it replaces.
+# Every step body below is byte-identical to the one it replaces, but for one expression in
+# "Version packages (Rush)" that restores what a push did before (see there).
 #
 #   uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
 #   with:
@@ -46,7 +47,9 @@ on:
         required: true
         type: boolean
       bump-type:
-        description: "Bump type, passed through from the caller's workflow_dispatch."
+        description: >-
+          Bump type, passed through from the caller's workflow_dispatch. Rush applies it to
+          lock-step version policies only; "none" (a push) means "patch", as it did before.
         required: false
         type: string
         default: "none"
@@ -195,10 +198,15 @@ jobs:
             echo "✅ Created change file for $SCOPED_NAME (type: $BUMP_TYPE)"
           done <<< "$BE_PACKAGES"
 
+      # In the copies this replaces, a push had no inputs, so `inputs.bump-type || 'patch'` was
+      # "patch". Here a push arrives as "none", which that expression passed through and Rush
+      # rejects ("The value of override-bump is not valid"): a push with change files failed. "none"
+      # is "patch" again, as it already is for the forced-mode change files above. It only moves
+      # lock-step policies; a caller on a prerelease line passes "prerelease".
       - name: Version packages (Rush)
         if: steps.rush-change.outputs.has-changes == 'true'
         run: |
-          node ./common/scripts/install-run-rush.js version --bump --override-bump ${{ inputs.bump-type || 'patch' }}
+          node ./common/scripts/install-run-rush.js version --bump --override-bump ${{ (inputs.bump-type == '' || inputs.bump-type == 'none') && 'patch' || inputs.bump-type }}
 
       - name: Prepare packages
         if: steps.rush-change.outputs.has-changes == 'true'
