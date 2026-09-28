@@ -21,6 +21,14 @@
 # The site is built by the package's own `build` script (`beplus-docs build`), which checks the
 # bundle and fails on an unreachable page or a broken link before anything is published.
 #
+# The project switcher: the brand bar of every beplus docs site switches between all of them, and
+# GitHub keeps that list — every repository in the organisation whose `docs-project` custom property
+# is set (the name the switcher shows), at the address its Pages site is served from. The job asks
+# for it with the organisation's `beplus` GitHub App (`BE_GITHUB_APP_ID`, a variable, and
+# `BE_GITHUB_APP_PRIVATE_KEY`, a secret; Metadata, Pages and custom properties read) and hands it to
+# the build as `DOCS_PROJECTS`. Without the App — a fork's pull request — the site shows the engine's
+# own list; a run whose own repository is not in GitHub's says so in its summary.
+#
 # The registry: `@beplus/docs-site` draws with @beplus/uix and FontAwesome Pro, installed from
 # npm.beplus.cloud. The job authenticates it as every other shared workflow here does — the
 # `cli` action's `beplus npm auth`, from `BE_NPM_TARGET` and `BE_NPM_TOKEN` — which writes the
@@ -125,6 +133,76 @@ jobs:
         if: steps.publish.outputs.publish == 'true'
         uses: actions/configure-pages@v5
 
+      # The projects the brand bar switches between, asked of GitHub rather than kept in the engine:
+      # a new portal is then in this site's switcher the next time this site is built, and one that
+      # moves to its own domain moves here with it. This run's own token reads only this repository,
+      # so the organisation's App reads the others; a run without it keeps the engine's own list.
+      - name: Check for the App that reads the organisation
+        id: app
+        env:
+          APP_ID: ${{ vars.BE_GITHUB_APP_ID }}
+          APP_KEY: ${{ secrets.BE_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Project switcher::BE_GITHUB_APP_ID or BE_GITHUB_APP_PRIVATE_KEY is not set here, so the switcher lists the engine's own projects."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get a token that reads the organisation
+        id: app-token
+        if: steps.app.outputs.ready == 'true'
+        # A token the App cannot have is a switcher out of date, not a site that cannot be published.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.BE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.BE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-metadata: read
+          permission-pages: read
+          permission-organization-custom-properties: read
+
+      - name: Ask GitHub which projects publish a portal
+        id: projects
+        if: steps.app-token.outputs.token != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          HERE: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          portals="$RUNNER_TEMP/docs-projects.tsv"
+          # Every repository with the property and a Pages site: owner/name, and the name to show.
+          gh api --paginate "orgs/$ORG/repos?per_page=100" \
+            --jq '.[] | select(.has_pages and (.archived | not) and ((.custom_properties["docs-project"] // "") != ""))
+                  | [.full_name, .custom_properties["docs-project"]] | @tsv' > "$portals"
+
+          list='[]'
+          while IFS=$'\t' read -r repo name; do
+            if href=$(gh api "repos/$repo/pages" --jq '.html_url' 2>/dev/null) && [ -n "$href" ]; then
+              list=$(jq -c --arg repo "$repo" --arg name "$name" --arg href "${href%/}" \
+                '. + [{ repo: $repo, name: $name, href: $href }]' <<< "$list")
+            else
+              echo "::warning title=Project switcher::$repo has docs-project set, but Pages does not say where its site is served, so the switcher leaves it out."
+            fi
+          done < "$portals"
+
+          count=$(jq 'length' <<< "$list")
+          if [ "$count" -eq 0 ]; then
+            echo "::warning title=Project switcher::No repository in $ORG has docs-project set, so the switcher lists the engine's own projects."
+            exit 0
+          fi
+          echo "DOCS_PROJECTS=$list" >> "$GITHUB_ENV"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if ! jq -e --arg here "$HERE" 'any(.[]; (.repo | ascii_downcase) == ($here | ascii_downcase))' <<< "$list" > /dev/null; then
+            echo "::warning title=Project switcher::$HERE is not in the switcher: set its docs-project property to the name to show, e.g. @beplus/<project>."
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          fi
+          jq -r '.[] | "\(.name)\t\(.href)"' <<< "$list"
+
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
@@ -161,6 +239,9 @@ jobs:
           OUT: ${{ inputs.working-directory }}/${{ inputs.output }}
           SITE_URL: ${{ steps.pages.outputs.base_url }}
           TITLE: ${{ inputs.title }}
+          PROJECTS: ${{ steps.projects.outputs.count }}
+          MISSING: ${{ steps.projects.outputs.missing }}
+          HERE: ${{ github.repository }}
         run: |
           {
             echo "### $TITLE"
@@ -168,6 +249,14 @@ jobs:
             echo "- **Pages**: $(find "$OUT" -name index.html | wc -l)"
             echo "- **Size**: $(du -sh "$OUT" | cut -f1)"
             echo "- **Served at**: ${SITE_URL:-not published — this run builds at the root}"
+            if [ -n "$PROJECTS" ]; then
+              echo "- **Project switcher**: $PROJECTS projects, from GitHub"
+            else
+              echo "- **Project switcher**: the engine's own list — GitHub was not asked, or did not answer"
+            fi
+            if [ "$MISSING" = "true" ]; then
+              echo "- **Not in the switcher**: $HERE has no \`docs-project\` property"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the site
