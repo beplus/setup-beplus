@@ -81,9 +81,9 @@ publishes on a push to `publish-branch`; a pull request builds and stops.
 
 It also asks GitHub which beplus projects publish a portal, for the site's
 project switcher (`DOCS_PROJECTS`): every repository with the org's
-`docs-project` custom property set, at its Pages address. That reads the other
-repositories with the org's `beplus` App — `BE_GITHUB_APP_ID` (variable) and
-`BE_GITHUB_APP_PRIVATE_KEY` (secret), with Metadata, Pages and custom
+`beplus-docs-project` custom property set, at its Pages address. That reads the
+other repositories with the org's `beplus` App — `BE_GITHUB_APP_ID` (variable)
+and `BE_GITHUB_APP_PRIVATE_KEY` (secret), with Metadata, Pages and custom
 properties read. Without them the site shows the engine's own list.
 
 ---

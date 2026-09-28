@@ -22,9 +22,9 @@
 # bundle and fails on an unreachable page or a broken link before anything is published.
 #
 # The project switcher: the brand bar of every beplus docs site switches between all of them, and
-# GitHub keeps that list — every repository in the organisation whose `docs-project` custom property
-# is set (the name the switcher shows), at the address its Pages site is served from. The job asks
-# for it with the organisation's `beplus` GitHub App (`BE_GITHUB_APP_ID`, a variable, and
+# GitHub keeps that list — every repository in the organisation whose `beplus-docs-project` custom
+# property is set (the name the switcher shows), at the address its Pages site is served from. The
+# job asks for it with the organisation's `beplus` GitHub App (`BE_GITHUB_APP_ID`, a variable, and
 # `BE_GITHUB_APP_PRIVATE_KEY`, a secret; Metadata, Pages and custom properties read) and hands it to
 # the build as `DOCS_PROJECTS`. Without the App — a fork's pull request — the site shows the engine's
 # own list; a run whose own repository is not in GitHub's says so in its summary.
@@ -177,8 +177,8 @@ jobs:
           portals="$RUNNER_TEMP/docs-projects.tsv"
           # Every repository with the property and a Pages site: owner/name, and the name to show.
           gh api --paginate "orgs/$ORG/repos?per_page=100" \
-            --jq '.[] | select(.has_pages and (.archived | not) and ((.custom_properties["docs-project"] // "") != ""))
-                  | [.full_name, .custom_properties["docs-project"]] | @tsv' > "$portals"
+            --jq '.[] | select(.has_pages and (.archived | not) and ((.custom_properties["beplus-docs-project"] // "") != ""))
+                  | [.full_name, .custom_properties["beplus-docs-project"]] | @tsv' > "$portals"
 
           list='[]'
           while IFS=$'\t' read -r repo name; do
@@ -186,19 +186,19 @@ jobs:
               list=$(jq -c --arg repo "$repo" --arg name "$name" --arg href "${href%/}" \
                 '. + [{ repo: $repo, name: $name, href: $href }]' <<< "$list")
             else
-              echo "::warning title=Project switcher::$repo has docs-project set, but Pages does not say where its site is served, so the switcher leaves it out."
+              echo "::warning title=Project switcher::$repo has beplus-docs-project set, but Pages does not say where its site is served, so the switcher leaves it out."
             fi
           done < "$portals"
 
           count=$(jq 'length' <<< "$list")
           if [ "$count" -eq 0 ]; then
-            echo "::warning title=Project switcher::No repository in $ORG has docs-project set, so the switcher lists the engine's own projects."
+            echo "::warning title=Project switcher::No repository in $ORG has beplus-docs-project set, so the switcher lists the engine's own projects."
             exit 0
           fi
           echo "DOCS_PROJECTS=$list" >> "$GITHUB_ENV"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           if ! jq -e --arg here "$HERE" 'any(.[]; (.repo | ascii_downcase) == ($here | ascii_downcase))' <<< "$list" > /dev/null; then
-            echo "::warning title=Project switcher::$HERE is not in the switcher: set its docs-project property to the name to show, e.g. @beplus/<project>."
+            echo "::warning title=Project switcher::$HERE is not in the switcher: set its beplus-docs-project property to the name to show, e.g. @beplus/<project>."
             echo "missing=true" >> "$GITHUB_OUTPUT"
           fi
           jq -r '.[] | "\(.name)\t\(.href)"' <<< "$list"
@@ -255,7 +255,7 @@ jobs:
               echo "- **Project switcher**: the engine's own list — GitHub was not asked, or did not answer"
             fi
             if [ "$MISSING" = "true" ]; then
-              echo "- **Not in the switcher**: $HERE has no \`docs-project\` property"
+              echo "- **Not in the switcher**: $HERE has no \`beplus-docs-project\` property"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
