@@ -224,12 +224,25 @@ jobs:
             --publish \
             --release-folder "$PACKAGES_DIR"
 
+      # `rush publish --pack --include-all` packs every publishable project, changed or not, so
+      # the loops below meet versions the registry already has: an individual-policy package with
+      # no change file, or one a failed run published but never committed. Those are skipped, not
+      # republished — an E409 used to stop the whole run before the version commit was pushed.
       - name: Publish to CodeArtifact
         if: steps.rush-change.outputs.has-changes == 'true'
         run: |
+          # Exit 0 when name@version is in the registry, 1 when it is not; anything else stops the run.
+          published() {
+            local out
+            if out=$(npm view "$1" version "${@:2}" 2>&1); then [ -n "$out" ]; return; fi
+            echo "$out" | grep -q E404 && return 1
+            echo "::error::Cannot tell whether $1 is published: $out"; exit 1
+          }
           for file in "$BE_PACKAGES_DIR"/*.tgz; do
             [ -f "$file" ] || continue
-            echo "Publishing $file"
+            spec=$(tar -xOzf "$file" package/package.json | jq -r '"\(.name)@\(.version)"')
+            if published "$spec"; then echo "Skipping $spec: already in CodeArtifact"; continue; fi
+            echo "Publishing $spec"
             npm publish "$file"
           done
 
@@ -240,9 +253,17 @@ jobs:
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > ~/.npmrc-github
           echo "@beplus:registry=https://npm.pkg.github.com" >> ~/.npmrc-github
 
+          published() {
+            local out
+            if out=$(npm view "$1" version "${@:2}" 2>&1); then [ -n "$out" ]; return; fi
+            echo "$out" | grep -q E404 && return 1
+            echo "::error::Cannot tell whether $1 is published: $out"; exit 1
+          }
           for file in "$BE_PACKAGES_DIR"/*.tgz; do
             [ -f "$file" ] || continue
-            echo "Publishing $file to GitHub Packages"
+            spec=$(tar -xOzf "$file" package/package.json | jq -r '"\(.name)@\(.version)"')
+            if published "$spec" --userconfig ~/.npmrc-github; then echo "Skipping $spec: already in GitHub Packages"; continue; fi
+            echo "Publishing $spec to GitHub Packages"
             npm publish "$file" --userconfig ~/.npmrc-github
           done
 
