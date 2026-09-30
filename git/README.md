@@ -6,10 +6,14 @@ Composite GitHub Action that configures Git for the GitHub Actions runner using 
 
 ## What it does
 
-1. Generates a token from the GitHub App (`beplus-release-bot`)
-2. Configures git user name and email
-3. Sets up git credentials helper with the generated token
-4. Enables secure git operations (push, tag, commit) in subsequent steps
+1. Generates a token from the GitHub App (`beplus-release-bot`).
+2. Authors CI's commits as `bea <bea@be.plus>`.
+3. Removes the `GITHUB_TOKEN` header that `actions/checkout` leaves behind. Git sends that header
+   before asking any credential helper, so without this step every push goes out as
+   `github-actions[bot]`. The org rulesets (`beplus/governance`) let only `beplus-release-bot`
+   through.
+4. Sets up the git credential helper with the App's token, so later steps can commit, tag and
+   push.
 
 ---
 
@@ -19,7 +23,9 @@ Composite GitHub Action that configures Git for the GitHub Actions runner using 
 |------|----------|---------|-------------|
 | `BE_RELEASE_GITHUB_APP_ID` | Yes | - | The App ID of your GitHub App |
 | `BE_RELEASE_GITHUB_APP_PRIVATE_KEY` | Yes | - | The private key of your GitHub App |
-| `BE_RELEASE_GITHUB_APP_NAME` | No | `beplus-release-bot` | Name of the GitHub App (used for git user.name and user.email) |
+| `GIT_USER_NAME` | No | `bea` | Who CI's commits are authored by |
+| `GIT_USER_EMAIL` | No | `bea@be.plus` | Their email |
+| `BE_RELEASE_GITHUB_APP_NAME` | No | `beplus-release-bot` | Deprecated; commits are authored as `GIT_USER_NAME` |
 
 ---
 

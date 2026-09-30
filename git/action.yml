@@ -8,9 +8,17 @@ inputs:
     description: "GitHub App private key"
     required: true
   BE_RELEASE_GITHUB_APP_NAME:
-    description: "Name of the GitHub App to generate token for"
+    description: "Deprecated: commits are authored as GIT_USER_NAME, not as the App"
     required: false
     default: "beplus-release-bot"
+  GIT_USER_NAME:
+    description: "Who CI's commits are authored by"
+    required: false
+    default: "bea"
+  GIT_USER_EMAIL:
+    description: "Their email"
+    required: false
+    default: "bea@be.plus"
 
 runs:
   using: "composite"
@@ -27,7 +35,11 @@ runs:
       env:
         GITHUB_APP_TOKEN: ${{ steps.app-token.outputs.token }}
       run: |
-        git config user.name "${{ inputs.BE_RELEASE_GITHUB_APP_NAME }}"
-        git config user.email "${{ inputs.BE_RELEASE_GITHUB_APP_NAME }}@users.noreply.github.com"
+        git config user.name "${{ inputs.GIT_USER_NAME }}"
+        git config user.email "${{ inputs.GIT_USER_EMAIL }}"
+        # actions/checkout leaves GITHUB_TOKEN in an extraheader, and git sends that before it ever
+        # asks a credential helper — so without this the push goes out as github-actions[bot], which
+        # the org rulesets do not let through. The release App is the only CI identity they bypass.
+        git config --local --unset-all "http.https://github.com/.extraheader" || true
         git config --global credential.helper store
         echo "https://x-access-token:${GITHUB_APP_TOKEN}@github.com" > ~/.git-credentials
