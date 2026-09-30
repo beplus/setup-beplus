@@ -63,6 +63,14 @@ on:
         required: false
         type: string
         default: "22.14"
+      after-version:
+        description: >-
+          A command run after `rush version` and before packing, in the repository root — for a
+          caller that derives files from the versions just bumped (uix syncs its guideline version
+          pins). A failure is a warning: the release goes out regardless.
+        required: false
+        type: string
+        default: ""
       aws-region:
         description: "AWS region for the OIDC role."
         required: false
@@ -207,6 +215,14 @@ jobs:
         if: steps.rush-change.outputs.has-changes == 'true'
         run: |
           node ./common/scripts/install-run-rush.js version --bump --override-bump ${{ (inputs.bump-type == '' || inputs.bump-type == 'none') && 'patch' || inputs.bump-type }}
+
+      # The caller's command arrives as data (env), never spliced into the script.
+      - name: After versioning
+        if: steps.rush-change.outputs.has-changes == 'true' && inputs.after-version != ''
+        continue-on-error: true
+        env:
+          AFTER_VERSION: ${{ inputs.after-version }}
+        run: bash -c "$AFTER_VERSION"
 
       - name: Prepare packages
         if: steps.rush-change.outputs.has-changes == 'true'
