@@ -57,6 +57,55 @@ nothing: a repository states what it already did. `scripts/verify-callers.mjs`
 checks that, resolving each caller against the shared workflow and comparing the
 enabled steps to the file it replaced.
 
+#### One version per commit, built once, promoted (`promote: true`)
+
+Without `promote`, each environment's run versions and publishes on its own, so one
+commit can be a different version, with different bytes, in each registry. With it, a
+library publishes the way cli_v2 releases the CLI:
+
+| Branch | The run | Its CodeArtifact | GitHub Packages | GitHub releases |
+|---|---|---|---|---|
+| `dev` | versions and packs once; GitHub Packages first, then dev's CodeArtifact; commits, tags, pushes | `latest` | `dev` | pre-releases |
+| `stage` | builds nothing: publishes the tarballs dev published, fetched from GitHub Packages | `latest` | `stage` | — |
+| `prod` | the same, for prod | `latest` | `latest` | full releases |
+
+- **stage and prod promote the versions their commit carries.** Fast-forward them to
+  a commit dev released. A version GitHub Packages does not have is refused.
+- **Dist-tags.** Each CodeArtifact is its environment's own registry, so a promoted
+  version becomes its `latest`: what an install in that environment gets. GitHub
+  Packages is the one registry every environment shares, so its tags show how far a
+  version got.
+- **No `[skip ci]` on the version commit.** GitHub skips a push whose head commit
+  says `[skip ci]`, and stage and prod fast-forward to exactly that commit. The dev
+  run skips the version commit by its message instead.
+- **Other branches.** With `promote`, the workflow does nothing on any branch but
+  these three.
+
+The caller adds the two branches and the input:
+
+```yaml
+on:
+  push:
+    branches: [dev, stage, prod]
+    paths: ['packages/**', 'common/changes/**']
+jobs:
+  publish:
+    uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
+    secrets: inherit
+    with:
+      packages: |
+        packages/core/docs
+      publish-to: "--to @beplus/docs"
+      force-change-files: true
+      promote: true
+```
+
+`stage` and `prod` each need, as `dev` does:
+- a GitHub environment with the variables `BE_ENVIRONMENT` and `BE_AWS_ACCOUNT_ID`;
+- the role `github-actions-beplus-<repo>-<env>-npm-publishing` in that account.
+
+They install nothing, so they need no `BE_NPM_TOKEN`.
+
 A repository's docs site — `@beplus/docs-site` from beplus/docs — is built and
 published to GitHub Pages by one more:
 
