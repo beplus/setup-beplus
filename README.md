@@ -40,7 +40,11 @@ jobs:
 ```
 
 ```yaml
-# .github/workflows/publish.yml — keep your own triggers, share the pipeline
+# .github/workflows/publish.yml — dev releases, stage and prod promote
+on:
+  push:
+    branches: [dev, stage, prod]
+    paths: ['packages/**', 'common/changes/**']
 jobs:
   publish:
     uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
@@ -54,14 +58,13 @@ jobs:
 
 Every optional step is an input that defaults to OFF, so adopting these changes
 nothing: a repository states what it already did. `scripts/verify-callers.mjs`
-checks that, resolving each caller against the shared workflow and comparing the
+checked that, resolving each caller against the shared workflow and comparing the
 enabled steps to the file it replaced.
 
-#### One version per commit, built once, promoted (`promote: true`)
+#### One version per commit, built once, promoted
 
-Without `promote`, each environment's run versions and publishes on its own, so one
-commit can be a different version, with different bytes, in each registry. With it, a
-library publishes the way cli_v2 releases the CLI:
+A library publishes the way cli_v2 releases the CLI. A version is cut once, on dev,
+and stage and prod publish those same bytes — never a build of their own:
 
 | Branch | The run | Its CodeArtifact | GitHub Packages | GitHub releases |
 |---|---|---|---|---|
@@ -78,27 +81,12 @@ library publishes the way cli_v2 releases the CLI:
 - **No `[skip ci]` on the version commit.** GitHub skips a push whose head commit
   says `[skip ci]`, and stage and prod fast-forward to exactly that commit. The dev
   run skips the version commit by its message instead.
-- **Other branches.** With `promote`, the workflow does nothing on any branch but
-  these three.
-
-The caller adds the two branches and the input:
-
-```yaml
-on:
-  push:
-    branches: [dev, stage, prod]
-    paths: ['packages/**', 'common/changes/**']
-jobs:
-  publish:
-    uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
-    secrets: inherit
-    with:
-      packages: |
-        packages/core/docs
-      publish-to: "--to @beplus/docs"
-      force-change-files: true
-      promote: true
-```
+- **Every version gets a changelog entry, a tag and a release.** Rush writes no
+  changelog for a prerelease (`0.1.0-next.N`), so the workflow writes the entry
+  from the change files and deletes them, as Rush does for a final version.
+- **Other branches.** The workflow does nothing on any branch but these three.
+- **`promote`** is how a caller opted in while the older per-environment pipeline
+  still existed. It is ignored now; drop it when you next touch the caller.
 
 `stage` and `prod` each need, as `dev` does:
 - a GitHub environment with the variables `BE_ENVIRONMENT` and `BE_AWS_ACCOUNT_ID`;
