@@ -13,8 +13,15 @@
 # preserved exactly, and the question becomes visible instead of being decided by
 # whichever copy this file was cut from.
 #
-# Every step body below is byte-identical to the one it replaces, but for one expression in
-# "Version packages (Rush)" that restores what a push did before (see there).
+# One version per commit, built once, promoted — the model cli_v2's own release follows:
+#
+#   dev           versions and packs once, and publishes those tarballs to GitHub Packages
+#                 first, then to dev's CodeArtifact. Its GitHub releases are pre-releases.
+#   stage, prod   build nothing. Each publishes the tarballs dev published, fetched from GitHub
+#                 Packages, to its own CodeArtifact. prod alone turns the GitHub releases into full
+#                 releases.
+#
+# The caller triggers on pushes to dev, stage and prod; on any other branch this does nothing.
 #
 #   uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
 #   with:
@@ -26,18 +33,6 @@
 #
 # See cli_v2 EXTRACTION-PLAN.md, slice R2-1.
 #
-# `promote: true` — one version per commit, built once, promoted, the model cli_v2's own release
-# follows. Each environment's run used to version and publish on its own, so the same commit could
-# be a different version, with different bytes, in each registry. With `promote`:
-#
-#   dev           versions and packs once, as `publish` does, and publishes those tarballs to
-#                 GitHub Packages first, then to dev's CodeArtifact. Its GitHub releases are
-#                 pre-releases.
-#   stage, prod   build nothing. Each publishes the tarballs dev published, fetched from GitHub
-#                 Packages, to its own CodeArtifact. prod alone turns the GitHub releases into full
-#                 releases.
-#
-# A caller that sets it also triggers on pushes to stage and prod; see the `release` job below.
 
 name: Library Publish
 
@@ -89,14 +84,13 @@ on:
         required: false
         type: string
         default: "us-east-1"
+      # Every library publishes one way now. The input stays so a caller that still passes it keeps
+      # working: a reusable workflow refuses an input it does not declare.
       promote:
-        description: >-
-          One version per commit, built once, promoted: dev publishes to GitHub Packages and its own
-          CodeArtifact, and stage and prod publish those same tarballs to theirs. Off: the `publish`
-          job, as it has always run.
+        description: "Deprecated and ignored: stage and prod always promote what dev released."
         required: false
         type: boolean
-        default: false
+        default: true
 
 # Required for AWS OIDC authentication and GitHub Packages publishing
 permissions:
@@ -109,370 +103,7 @@ env:
   AWS_REGION: ${{ inputs.aws-region }}
 
 jobs:
-  publish:
-    name: Publish
-    # With `promote`, `release` (dev) and `promote` (stage, prod) run instead.
-    if: ${{ !inputs.promote }}
-    runs-on: ubuntu-latest
-
-    environment: ${{ github.ref_name }}
-
-    env:
-      BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
-      BE_PACKAGES: ${{ inputs.packages }}
-
-    steps:
-      - name: Checkout monorepo
-        uses: actions/checkout@v4
-
-      - name: Configure Git
-        uses: beplus/setup-beplus/git@v2
-        with:
-          BE_RELEASE_GITHUB_APP_ID: ${{ secrets.BE_RELEASE_GITHUB_APP_ID }}
-          BE_RELEASE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.BE_RELEASE_GITHUB_APP_PRIVATE_KEY }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ inputs.node-version }}
-
-      - name: Cache Rush and pnpm
-        uses: actions/cache@v4
-        with:
-          path: |
-            common/temp
-            ~/.rush
-            ~/.pnpm-store
-          key: ${{ runner.os }}-rush-${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
-          restore-keys: |
-            ${{ runner.os }}-rush-
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-beplus-${{ github.event.repository.name }}-${{ github.ref_name }}-npm-publishing
-          aws-region: us-east-1
-
-      - run: aws sts get-caller-identity
-
-      - uses: beplus/setup-beplus/cli@v2
-        env:
-          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
-          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
-        with:
-          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION || 'latest' }}
-          BE_NPM_AUTH: true
-
-      - name: Install the Dependencies
-        run: node ./common/scripts/install-run-rush.js install
-
-      - name: Authenticate with AWS CodeArtifact
-        run: |
-          # The environment decides which CodeArtifact domain/repository the
-          # token is minted for. The CLI silently falls back to "dev" when it
-          # is unset, which would quietly publish a main release into dev.
-          if [ -z "${BE_ENVIRONMENT}" ]; then
-            echo "::error::BE_ENVIRONMENT is empty - set the BE_ENVIRONMENT variable on the '${{ github.ref_name }}' GitHub environment."
-            exit 1
-          fi
-          beplus aws codeartifact auth --env "${BE_ENVIRONMENT}"
-
-      - name: Build packages
-        run: |
-          node ./common/scripts/install-run-rush.js rebuild \
-            ${{ inputs.publish-to }} \
-            --verbose
-
-      - name: Check for changes (Rush Change)
-        id: rush-change
-        run: |
-          # In "force" mode, skip change verification
-          if [ "${{ inputs.force }}" = "true" ]; then
-            echo "has-changes=true" >> $GITHUB_OUTPUT
-            echo "🐛 FORCE MODE: Skipping change verification"
-          elif [ -d "common/changes" ] && [ "$(ls -A common/changes)" ]; then
-            echo "has-changes=true" >> $GITHUB_OUTPUT
-            echo "✅ Change files detected"
-          else
-            echo "has-changes=false" >> $GITHUB_OUTPUT
-            echo "⚠️ No change files found"
-          fi
-
-      - name: Create a change file for forced mode
-        if: inputs.force && inputs.force-change-files
-        run: |
-          mkdir -p common/changes
-          BUMP_TYPE="${{ inputs.bump-type }}"
-          [ "$BUMP_TYPE" = "none" ] && BUMP_TYPE="patch"
-
-          # Create a change file for each package
-          COUNTER=0
-          while IFS= read -r package; do
-            [ -z "$package" ] && continue
-            COUNTER=$((COUNTER + 1))
-            # Extract package name from path (e.g., docs-core from packages/core/docs-core)
-            PACKAGE_NAME=$(basename "$package")
-            # Convert to scoped package name (e.g., @beplus/docs-core)
-            SCOPED_NAME="@beplus/$PACKAGE_NAME"
-
-            cat > "common/changes/force-bump-$COUNTER.json" << EOF
-          {
-            "changes": [
-              {
-                "packageName": "$SCOPED_NAME",
-                "comment": "Forced release",
-                "type": "$BUMP_TYPE"
-              }
-            ],
-            "packageName": "$SCOPED_NAME"
-          }
-          EOF
-            echo "✅ Created change file for $SCOPED_NAME (type: $BUMP_TYPE)"
-          done <<< "$BE_PACKAGES"
-
-      # In the copies this replaces, a push had no inputs, so `inputs.bump-type || 'patch'` was
-      # "patch". Here a push arrives as "none", which that expression passed through and Rush
-      # rejects ("The value of override-bump is not valid"): a push with change files failed. "none"
-      # is "patch" again, as it already is for the forced-mode change files above. It only moves
-      # lock-step policies; a caller on a prerelease line passes "prerelease".
-      - name: Version packages (Rush)
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          node ./common/scripts/install-run-rush.js version --bump --override-bump ${{ (inputs.bump-type == '' || inputs.bump-type == 'none') && 'patch' || inputs.bump-type }}
-
-      # The caller's command arrives as data (env), never spliced into the script.
-      - name: After versioning
-        if: steps.rush-change.outputs.has-changes == 'true' && inputs.after-version != ''
-        continue-on-error: true
-        env:
-          AFTER_VERSION: ${{ inputs.after-version }}
-        run: bash -c "$AFTER_VERSION"
-
-      - name: Prepare packages
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          PACKAGES_DIR="${GITHUB_WORKSPACE}/.packages"
-          rm -rf "$PACKAGES_DIR"
-          mkdir -p "$PACKAGES_DIR"
-
-          echo "BE_PACKAGES_DIR=$PACKAGES_DIR" >> "$GITHUB_ENV"
-          echo "Packages dir: $PACKAGES_DIR"
-
-          node ./common/scripts/install-run-rush.js publish \
-            --pack \
-            --include-all \
-            --publish \
-            --release-folder "$PACKAGES_DIR"
-
-      # `rush publish --pack --include-all` packs every publishable project, changed or not, so
-      # the loops below meet versions the registry already has: an individual-policy package with
-      # no change file, or one a failed run published but never committed. Those are skipped, not
-      # republished — an E409 used to stop the whole run before the version commit was pushed.
-      - name: Publish to CodeArtifact
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          # Exit 0 when name@version is in the registry, 1 when it is not; anything else stops the run.
-          published() {
-            local out
-            if out=$(npm view "$1" version "${@:2}" 2>&1); then [ -n "$out" ]; return; fi
-            echo "$out" | grep -q E404 && return 1
-            echo "::error::Cannot tell whether $1 is published: $out"; exit 1
-          }
-          for file in "$BE_PACKAGES_DIR"/*.tgz; do
-            [ -f "$file" ] || continue
-            spec=$(tar -xOzf "$file" package/package.json | jq -r '"\(.name)@\(.version)"')
-            if published "$spec"; then echo "Skipping $spec: already in CodeArtifact"; continue; fi
-            echo "Publishing $spec"
-            npm publish "$file"
-          done
-
-      - name: Publish to GitHub Packages
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          # Configure npm for GitHub Packages
-          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > ~/.npmrc-github
-          echo "@beplus:registry=https://npm.pkg.github.com" >> ~/.npmrc-github
-
-          published() {
-            local out
-            if out=$(npm view "$1" version "${@:2}" 2>&1); then [ -n "$out" ]; return; fi
-            echo "$out" | grep -q E404 && return 1
-            echo "::error::Cannot tell whether $1 is published: $out"; exit 1
-          }
-          for file in "$BE_PACKAGES_DIR"/*.tgz; do
-            [ -f "$file" ] || continue
-            spec=$(tar -xOzf "$file" package/package.json | jq -r '"\(.name)@\(.version)"')
-            if published "$spec" --userconfig ~/.npmrc-github; then echo "Skipping $spec: already in GitHub Packages"; continue; fi
-            echo "Publishing $spec to GitHub Packages"
-            npm publish "$file" --userconfig ~/.npmrc-github
-          done
-
-      - name: Commit version changes
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          git add .
-          git commit -m "chore: publish packages [skip ci]"
-
-      - name: Create git tags from CHANGELOGs
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          # Find CHANGELOG.json files that were modified by rush version
-          git diff HEAD~1 --name-only | grep "CHANGELOG.json$" | while read changelog; do
-            if [ -f "$changelog" ]; then
-              tag=$(jq -r '.entries[0].tag // empty' "$changelog")
-              if [ -n "$tag" ]; then
-                echo "Creating tag: $tag"
-                git tag -a "$tag" -m "$tag"
-              fi
-            fi
-          done
-
-      - name: Push version changes
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          git push origin dev --follow-tags
-
-      - name: Create GitHub releases with artifacts
-        if: steps.rush-change.outputs.has-changes == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const { execSync } = require('child_process');
-
-            // Find all CHANGELOG.json files that were modified
-            const changelogs = execSync('git diff HEAD~1 --name-only')
-              .toString()
-              .split('\n')
-              .filter(f => f.includes('CHANGELOG.json') && f);
-
-            for (const changelog of changelogs) {
-              if (fs.existsSync(changelog)) {
-                const data = JSON.parse(fs.readFileSync(changelog, 'utf8'));
-                const tag = data.entries[0]?.tag;
-
-                if (tag) {
-                  const comments = data.entries[0]?.comments || {};
-                  const releaseNotes = Object.values(comments)
-                    .flat()
-                    .map(c => c.comment)
-                    .join('\n') || 'Release notes not available';
-
-                  try {
-                    const release = await github.rest.repos.createRelease({
-                      owner: context.repo.owner,
-                      repo: context.repo.repo,
-                      tag_name: tag,
-                      body: releaseNotes,
-                      draft: false,
-                      prerelease: false
-                    });
-
-                    // Extract package name and version from tag (e.g., @beplus/auth_v0.10.0)
-                    const tagMatch = tag.match(/^@?[\w-]+\/?([\w-]+)_v(.+)$/);
-                    core.info(`Tag: ${tag}, Match: ${JSON.stringify(tagMatch)}`);
-
-                    if (tagMatch) {
-                      const packageName = tagMatch[1];
-                      const version = tagMatch[2];
-                      core.info(`Looking for artifact: packageName=${packageName}, version=${version}`);
-
-                      // Search for matching tgz file in "$BE_PACKAGES_DIR"
-                      const artifactsDir = process.env.BE_PACKAGES_DIR;
-                      core.info(`Artifacts directory: ${artifactsDir}`);
-
-                      if (fs.existsSync(artifactsDir)) {
-                        const files = fs.readdirSync(artifactsDir);
-                        core.info(`Files in artifacts dir: ${JSON.stringify(files)}`);
-
-                        const tgzFile = files.find(f =>
-                          f.includes(packageName) && f.includes(version) && f.endsWith('.tgz')
-                        );
-                        core.info(`Matching tgz file: ${tgzFile || 'NOT FOUND'}`);
-
-                        if (tgzFile) {
-                          const tgzPath = path.join(artifactsDir, tgzFile);
-                          core.info(`Uploading: ${tgzPath}`);
-
-                          await github.rest.repos.uploadReleaseAsset({
-                            owner: context.repo.owner,
-                            repo: context.repo.repo,
-                            release_id: release.data.id,
-                            name: tgzFile,
-                            data: fs.readFileSync(tgzPath)
-                          });
-                          core.info(`Uploaded artifact: ${tgzFile}`);
-                        } else {
-                          core.warning(`No matching tgz file found for ${packageName}@${version}`);
-                        }
-                      } else {
-                        core.warning(`Artifacts directory does not exist: ${artifactsDir}`);
-                      }
-                    } else {
-                      core.warning(`Could not parse tag: ${tag}`);
-                    }
-
-                    core.info(`Created release for ${tag}`);
-                  } catch (error) {
-                    core.warning(`Could not create release for ${tag}: ${error.message}`);
-                  }
-                }
-              }
-            }
-
-      - name: Create release notes
-        if: steps.rush-change.outputs.has-changes == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-
-            // Parse packages from environment variable
-            const packagesEnv = process.env.BE_PACKAGES;
-            const packages = packagesEnv.trim().split('\n').filter(p => p.trim());
-
-            let allReleaseNotes = '## Release Notes\n\n';
-            let summary = '';
-
-            for (const packagePath of packages) {
-              const packageName = path.basename(packagePath);
-              const scopedName = `@beplus/${packageName}`;
-              const changelogPath = path.join(process.cwd(), packagePath, 'CHANGELOG.md');
-              const packageJsonPath = path.join(process.cwd(), packagePath, 'package.json');
-
-              let packageReleaseNotes = '';
-              let version = 'unknown';
-
-              if (fs.existsSync(changelogPath)) {
-                const changelog = fs.readFileSync(changelogPath, 'utf8');
-                const latestEntry = changelog.split('\n## ')[1];
-                if (latestEntry) {
-                  packageReleaseNotes = latestEntry;
-                }
-              }
-
-              if (fs.existsSync(packageJsonPath)) {
-                const packageJson = require(packageJsonPath);
-                version = packageJson.version;
-              }
-
-              allReleaseNotes += `### ${scopedName}@${version}\n\n${packageReleaseNotes}\n\n`;
-              summary += `- **${scopedName}@${version}**\n`;
-            }
-
-            core.info(`Published all packages`);
-            core.summary
-              .addHeading('📦 Published Packages')
-              .addRaw(summary)
-              .addHeading('📝 Release Notes')
-              .addRaw(allReleaseNotes)
-              .write();
-
-  # ── `promote: true` ────────────────────────────────────────────────────────────────────────
-  #
-  # `release` is `publish` up to the pack, run on dev only. What it does with the tarballs
-  # differs:
+  # `release` versions, packs and publishes, on dev only:
   #   - GitHub Packages first, dist-tag `dev`. Every later promotion copies a version from there,
   #     so a version reaches a CodeArtifact only once GitHub Packages has it.
   #   - Then dev's CodeArtifact, dist-tag `latest`. Each environment's registry is its own, and its
@@ -485,7 +116,7 @@ jobs:
   release:
     name: Release on dev
     if: >-
-      inputs.promote && github.ref_name == 'dev'
+      github.ref_name == 'dev'
       && !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: publish packages'))
     runs-on: ubuntu-latest
 
@@ -502,7 +133,6 @@ jobs:
       BE_PACKAGES: ${{ inputs.packages }}
 
     steps:
-      # From here to "Prepare packages", the steps are `publish`'s.
       - name: Checkout monorepo
         uses: actions/checkout@v4
 
@@ -582,8 +212,15 @@ jobs:
         if: inputs.force && inputs.force-change-files
         run: |
           mkdir -p common/changes
+          # A change file's type is none, patch, minor or major: Rush refuses "prerelease" and the
+          # other pre* bumps, which only `--override-bump` takes. A lock-step policy moves by that
+          # override, so its change file just has to be valid.
           BUMP_TYPE="${{ inputs.bump-type }}"
-          [ "$BUMP_TYPE" = "none" ] && BUMP_TYPE="patch"
+          case "$BUMP_TYPE" in
+            none) BUMP_TYPE="patch" ;;
+            prerelease) BUMP_TYPE="none" ;;
+            pre*) BUMP_TYPE="${BUMP_TYPE#pre}" ;;
+          esac
 
           # Create a change file for each package
           COUNTER=0
@@ -619,6 +256,110 @@ jobs:
         if: steps.rush-change.outputs.has-changes == 'true'
         run: |
           node ./common/scripts/install-run-rush.js version --bump --override-bump ${{ (inputs.bump-type == '' || inputs.bump-type == 'none') && 'patch' || inputs.bump-type }}
+
+      # Rush writes no changelog for a prerelease version: it keeps the change files for the final
+      # release. The tags and GitHub releases are made from the changelog, so a repository on a
+      # prerelease line — ai and rush, on 0.1.0-next.N — published with no tag and no release, and
+      # its change files piled up, so every later push found "changes" and cut another version.
+      #
+      # So every publishable project whose version this run changed, and whose CHANGELOG.json has
+      # no entry for it, gets the entry Rush would have written, from its change files, which are
+      # then deleted: each prerelease carries its own notes. A project Rush did write an entry for
+      # is left alone.
+      - name: Write the changelogs Rush leaves out
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          cat > "${RUNNER_TEMP}/changelogs.cjs" <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const { execFileSync } = require('child_process');
+          const readJsonc = (file) => {
+            const keepStrings = (match) => (match[0] === '"' ? match : '');
+            const text = fs.readFileSync(file, 'utf8')
+              .replace(/"(?:[^"\\]|\\.)*"|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, keepStrings)
+              .replace(/"(?:[^"\\]|\\.)*"|,(?=\s*[}\]])/g, keepStrings);
+            return JSON.parse(text);
+          };
+          const committed = (file) => {
+            try { return execFileSync('git', ['show', `HEAD:${file}`], { encoding: 'utf8' }); } catch { return undefined; }
+          };
+
+          const rush = readJsonc('rush.json');
+          const separator = rush.gitTagSeparator ?? '_';
+          const policiesFile = 'common/config/rush/version-policies.json';
+          const policies = fs.existsSync(policiesFile) ? readJsonc(policiesFile) : [];
+          const policy = (name) => policies.find((p) => p.policyName === name);
+
+          // Every change file's changes, by package; a file is deleted once each package it names is.
+          const changesDir = 'common/changes';
+          const changeFiles = [];
+          if (fs.existsSync(changesDir)) {
+            for (const dir of fs.readdirSync(changesDir, { recursive: true })) {
+              const file = path.join(changesDir, dir);
+              if (file.endsWith('.json') && fs.statSync(file).isFile()) {
+                changeFiles.push({ file, changes: JSON.parse(fs.readFileSync(file, 'utf8')).changes ?? [] });
+              }
+            }
+          }
+
+          const done = new Set();
+          for (const project of rush.projects) {
+            if (!project.shouldPublish && !project.versionPolicyName) continue;
+            const pkgFile = path.join(project.projectFolder, 'package.json');
+            const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
+            const before = committed(pkgFile);
+            if (pkg.private || (before && JSON.parse(before).version === pkg.version)) continue;
+
+            // A lock-step policy with a main project keeps its one changelog there, as Rush does.
+            const lockStep = policy(project.versionPolicyName);
+            const isLockStep = lockStep?.definitionName === 'lockStepVersion';
+            if (isLockStep && lockStep.mainProject && lockStep.mainProject !== project.packageName) {
+              done.add(project.packageName);
+              continue;
+            }
+
+            const jsonFile = path.join(project.projectFolder, 'CHANGELOG.json');
+            const changelog = fs.existsSync(jsonFile)
+              ? JSON.parse(fs.readFileSync(jsonFile, 'utf8'))
+              : { name: project.packageName, entries: [] };
+            if (changelog.entries.some((entry) => entry.version === pkg.version)) continue;
+
+            const comments = {};
+            for (const { changes } of changeFiles) {
+              for (const change of changes) {
+                if (change.packageName !== project.packageName || !change.comment) continue;
+                (comments[change.type] ??= []).push({ comment: change.comment });
+              }
+            }
+            const date = new Date().toUTCString();
+            changelog.name = project.packageName;
+            changelog.entries.unshift({ version: pkg.version, tag: `${project.packageName}${separator}v${pkg.version}`, date, comments });
+            fs.writeFileSync(jsonFile, JSON.stringify(changelog, null, 2) + '\n');
+
+            // The markdown Rush renders from the json.
+            const section = (title, list) => (list ? `### ${title}\n\n${list.map((c) => `- ${c.comment}\n`).join('')}\n` : '');
+            let md = `# Change Log - ${changelog.name}\n\nThis log was last generated on ${date} and should not be manually modified.\n\n`;
+            changelog.entries.forEach((entry, index) => {
+              md += `## ${entry.version}\n${entry.date ? `${entry.date}\n` : ''}\n`;
+              const c = entry.comments ?? {};
+              const body = section('Breaking changes', c.major) + section('Minor changes', c.minor) + section('Patches', c.patch)
+                + (isLockStep ? section('Updates', c.none) : '') + (rush.hotfixChangeEnabled ? section('Hotfixes', c.hotfix) : '');
+              md += body || `${index === changelog.entries.length - 1 ? '_Initial release_' : '_Version update only_'}\n\n`;
+            });
+            fs.writeFileSync(path.join(project.projectFolder, 'CHANGELOG.md'), md);
+
+            done.add(project.packageName);
+            console.log(`Changelog entry for ${project.packageName}@${pkg.version}`);
+          }
+
+          for (const { file, changes } of changeFiles) {
+            if (changes.length && changes.every((change) => done.has(change.packageName))) {
+              fs.rmSync(file);
+              console.log(`Deleted ${file}`);
+            }
+          }
+          EOF
+          node "${RUNNER_TEMP}/changelogs.cjs"
 
       # The caller's command arrives as data (env), never spliced into the script.
       - name: After versioning
@@ -783,7 +524,7 @@ jobs:
   # released, and is refused.
   promote:
     name: Promote to ${{ github.ref_name }}
-    if: inputs.promote && (github.ref_name == 'stage' || github.ref_name == 'prod')
+    if: github.ref_name == 'stage' || github.ref_name == 'prod'
     runs-on: ubuntu-latest
 
     environment: ${{ github.ref_name }}
