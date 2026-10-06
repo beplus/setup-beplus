@@ -96,6 +96,43 @@ and stage and prod publish those same bytes — never a build of their own:
 
 They install nothing, so they need no `BE_NPM_TOKEN`.
 
+An estate's pull-request `cdk diff` — one sticky comment per CDK app — is one more.
+The three estates carried a 186-line copy each; the role, the region and the
+comment marker were the only differences, and all three are derived (the role
+`github-actions-<owner>-<repo>-<env>-cdk-diff` from the calling repository, the
+region from `beplus.estate.json` → `defaultRegion`, the marker from `naming.product`),
+so it has no inputs. The trigger, the permissions and the concurrency group stay
+in the repository:
+
+```yaml
+# .github/workflows/infra-diff.yml
+name: infra diff
+on:
+  pull_request:
+    paths:
+      - "packages/aws/**"
+      - "packages/apps/<app>/.bepluscloud/**"
+      - ".github/workflows/infra-diff.yml"
+      - "beplus.estate.json"
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+concurrency:
+  group: infra-diff-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  infra-diff:
+    uses: beplus/setup-beplus/.github/workflows/infra-diff.yml@v2
+    secrets: inherit
+```
+
+It cannot deploy: the composite always runs in `mode: diff` as the read-only
+`…-cdk-diff` role, and nothing a caller passes can change either. It installs the
+CLI the repository pins (`cli.version`). `node scripts/verify-callers.mjs infra-diff
+--repo <estate>` proves a caller plus this workflow reproduce the file it replaced,
+step for step.
+
 A repository's docs site — `@beplus/docs-site` from beplus/docs — is built and
 published to GitHub Pages by one more:
 

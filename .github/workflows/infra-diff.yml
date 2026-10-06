@@ -1,0 +1,260 @@
+# What a pull request would do to an estate, before it does it — once.
+# --------------------------------------------------------------------
+# bepluscloud/ai, ironmountain-cz/monorepo and mrkithq/monorepo each carried a
+# 186-line copy of this file. Their jobs differed in exactly three values, and
+# every one of them is already written down somewhere this workflow can read:
+#
+#   the role       github-actions-<owner>-<repo>-<env>-cdk-diff
+#                  → from the calling repository (`github.repository_owner`,
+#                    `github.event.repository.name`), the way each estate's
+#                    packages/aws/main GitHubOIDCStack names it
+#   the region     us-east-1 / eu-central-1
+#                  → beplus.estate.json `defaultRegion` (`vars.AWS_REGION`
+#                    still wins, as it did)
+#   the marker     <!-- be- / mountaineer- / mrkit-infra-diff:<pkg> -->
+#                  → beplus.estate.json `naming.product`, lower-cased, so the
+#                    switch edits a pull request's existing comment instead of
+#                    adding a second one
+#
+# so there are no inputs. Everything else — every step body — is byte-identical
+# to the copies it replaces, bar the CLI version: `vars.BE_CLI_VERSION || '2'`
+# floated on the newest 2.x; empty now installs the repository's pin
+# (beplus.estate.json → cli.version, `be auto`; BE-213), and the variable still
+# wins when it is set. `scripts/verify-callers.mjs infra-diff` proves it.
+#
+# What stays in the repository is what is the repository's: when it runs (the
+# paths), the permissions it grants, and the concurrency group.
+#
+#   name: infra diff
+#   on:
+#     pull_request:
+#       paths: ["packages/aws/**", "beplus.estate.json", ".github/workflows/infra-diff.yml", …]
+#   permissions:
+#     id-token: write
+#     contents: read
+#     pull-requests: write
+#   concurrency:
+#     group: infra-diff-${{ github.event.pull_request.number || github.ref }}
+#     cancel-in-progress: true
+#   jobs:
+#     infra-diff:
+#       uses: beplus/setup-beplus/.github/workflows/infra-diff.yml@v2
+#       secrets: inherit
+#
+# ⚠️ THIS WORKFLOW CANNOT DEPLOY ANYTHING, AND NOT BECAUSE IT PROMISES NOT TO.
+# It assumes `…-<env>-cdk-diff`, whose only `sts:AssumeRole` grant is the CDK
+# `lookup` role — read-only by construction. The `deploy` / `file-publishing` /
+# `image-publishing` roles that `cdk deploy` needs are not reachable from it,
+# and `…-<env>-cdk-deploy`, which can reach them, does not trust
+# `pull_request` at all. Both are IAM, in the account, deployed from each
+# estate's `packages/aws/main`.
+#
+# And there is nothing here a caller can turn: no input reaches the composite.
+# `mode: diff` and the `-cdk-diff` suffix are literals, and a caller that passes
+# `mode` (or anything else) under `with:` is refused by GitHub before a job
+# starts, because no input is declared. Keep it that way — an input that could
+# select the mode or the role is exactly the switch the role split exists to
+# make useless. `beplus infra lint` still checks the caller's own jobs.
+#
+# See cli_v2 EXTRACTION-PLAN.md, slice R2-3, and Linear BE-218.
+
+name: infra diff
+
+on:
+  workflow_call:
+    secrets:
+      BE_NPM_TOKEN:
+        description: >-
+          npm.beplus.cloud token for the @beplus scope. An environment secret in
+          the estates — the diff job claims the environment, which is how it
+          reaches it — so `secrets: inherit` (or nothing) is all a caller passes.
+        required: false
+
+# The caller must grant all three: a called workflow can only narrow these.
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # The matrix comes from beplus.estate.json so that the
+  # list of CDK apps lives in one file rather than in three.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      packages: ${{ steps.plan.outputs.packages }}
+      region: ${{ steps.estate.outputs.region }}
+      marker: ${{ steps.estate.outputs.marker }}
+    steps:
+      - uses: actions/checkout@v4
+      # `beplus infra` reads beplus.estate.json and nothing
+      # else — no AWS, no network. The install is the price of the five .mjs
+      # programs this plan job used to carry a copy of; see cli_v2
+      # EXTRACTION-PLAN.md, slice R1-2.
+      - name: Install the beplus CLI
+        uses: beplus/setup-beplus/cli@v2
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
+
+      # ⚠️ THE CHECK THAT NO PULL-REQUEST PATH CAN DEPLOY. It reads the calling
+      # repository's own workflows against its own manifest, and it belongs on a
+      # PR — where a reviewer sees it go red — not only in an npm script nobody
+      # runs.
+      - name: Check the workflows against the manifest
+        run: beplus infra lint
+
+      - id: plan
+        env:
+          MODE: diff
+          BASE_REF: ${{ github.base_ref }}
+        run: beplus infra matrix --githubOutput >> "$GITHUB_OUTPUT"
+
+      # The two values each estate's copy of this file wrote out by hand, read
+      # from the manifest that already holds them (the CLI resolves the same
+      # file, in the same order, with the same us-east-1 default).
+      #
+      # Both come from the pull request's own tree, so both are treated as
+      # data: checked here, and handed to the comment script through `env`,
+      # never pasted into it.
+      - name: Read the region and the comment marker from the manifest
+        id: estate
+        run: |
+          set -euo pipefail
+          manifest=beplus.estate.json
+          [ -f "$manifest" ] || manifest=.github/actions/cdk-package/packages.json
+
+          # ⚠️ NOT us-east-1 EVERYWHERE: Mountaineer runs in eu-central-1, and
+          # a wrong region addresses an account with nothing in it.
+          region="$(jq -r '.defaultRegion // "us-east-1"' "$manifest")"
+          if ! [[ "$region" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]; then
+            echo "::error file=$manifest::defaultRegion \"$region\" is not an AWS region."
+            exit 1
+          fi
+
+          # be, mountaineer, mrkit — the markers the three copies used.
+          product="$(jq -r '.naming.product // empty' "$manifest")"
+          marker="$(printf '%s' "${product:-${GITHUB_REPOSITORY#*/}}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')"
+
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+          echo "marker=$marker" >> "$GITHUB_OUTPUT"
+
+  diff:
+    name: ${{ matrix.package }} · ${{ matrix.env }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # Claiming the environment is how the job reaches BE_NPM_TOKEN, which is an
+    # environment secret. On GitHub Free it adds no gate; with Environment
+    # protection rules it would make every diff wait for a reviewer, which is
+    # why the reviewers go on `infra.yml`'s jobs and not on these.
+    environment: ${{ matrix.env }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # Kept from the estates' copies, where the composite was a LOCAL action
+      # and the runner could not find its action.yml without a checkout. The
+      # shared composite checks the repository out itself; this one stays so
+      # the steps are exactly the ones the copies ran.
+      - uses: actions/checkout@v4
+      - uses: beplus/setup-beplus/cdk-package@v2
+        with:
+          cli-version: ${{ vars.BE_CLI_VERSION }}
+          package: ${{ matrix.package }}
+          env: ${{ matrix.env }}
+          mode: diff
+          role-arn: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ matrix.env }}-cdk-diff
+          aws-region: ${{ vars.AWS_REGION || needs.plan.outputs.region }}
+          npm-token: ${{ secrets.BE_NPM_TOKEN }}
+          npm-target: ${{ vars.BE_NPM_TARGET }}
+
+  # One comment per PACKAGE, not per matrix leg: `main` deploys to every
+  # account, and one comment per account about one package is how a reviewer
+  # learns to scroll past all of them.
+  comment:
+    name: comment
+    needs: [plan, diff]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: diffs
+          pattern: cdk-diff-*
+          merge-multiple: false
+
+      - uses: actions/github-script@v7
+        env:
+          PACKAGES: ${{ needs.plan.outputs.packages }}
+          DIFF_JOB_RESULT: ${{ needs.diff.result }}
+          MARKER: ${{ needs.plan.outputs.marker }}
+        with:
+          script: |
+            const { readFileSync, readdirSync, existsSync } = require("node:fs");
+            const { join } = require("node:path");
+
+            // Sticky by an HTML marker rather than by a bot name: the same
+            // comment is edited on every push, so a 40-commit PR has six
+            // comments and not two hundred and forty.
+            const marker = (pkg) => `<!-- ${process.env.MARKER}-infra-diff:${pkg} -->`;
+            const MAX = 55000; // GitHub rejects a comment body over 65536.
+
+            const packages = JSON.parse(process.env.PACKAGES || "[]");
+            const root = "diffs";
+            const existing = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: context.issue.number, per_page: 100,
+            });
+
+            for (const pkg of packages) {
+              // One artifact per (package, environment): cdk-diff-<pkg>-<env>.
+              const dirs = existsSync(root)
+                ? readdirSync(root).filter((d) => d.startsWith(`cdk-diff-${pkg}-`))
+                : [];
+
+              const sections = [];
+              for (const dir of dirs.sort()) {
+                const env = dir.replace(`cdk-diff-${pkg}-`, "");
+                const files = readdirSync(join(root, dir));
+                const body = files
+                  .filter((f) => f.endsWith(".diff.txt"))
+                  .map((f) => readFileSync(join(root, dir, f), "utf8"))
+                  .join("\n") || "_no output captured_";
+                const nag = files.find((f) => f.startsWith("cdk-nag-"));
+                sections.push(
+                  `<details${body.includes("There were no differences") ? "" : " open"}>` +
+                  `<summary><code>${env}</code></summary>\n\n\`\`\`diff\n${body.trim()}\n\`\`\`\n` +
+                  (nag ? `\n**cdk-nag**\n\n${readFileSync(join(root, dir, nag), "utf8")}\n` : "") +
+                  `</details>`,
+                );
+              }
+
+              let text = [
+                marker(pkg),
+                `### \`packages/aws/${pkg}\` — cdk diff`,
+                "",
+                sections.length ? sections.join("\n\n") : "_no diff was produced for this package_",
+                "",
+                `<sub>${process.env.DIFF_JOB_RESULT === "success"
+                  ? "All diff jobs succeeded."
+                  : `⚠️ The diff matrix finished \`${process.env.DIFF_JOB_RESULT}\` — a section may be missing rather than empty.`
+                } Full output is in the run's artifacts.</sub>`,
+              ].join("\n");
+
+              if (text.length > MAX) {
+                text = text.slice(0, MAX) +
+                  "\n```\n\n<sub>Truncated. The whole diff is in this run's artifacts.</sub>";
+              }
+
+              const previous = existing.find((c) => c.body?.includes(marker(pkg)));
+              if (previous) {
+                await github.rest.issues.updateComment({ ...context.repo, comment_id: previous.id, body: text });
+              } else {
+                await github.rest.issues.createComment({
+                  ...context.repo, issue_number: context.issue.number, body: text,
+                });
+              }
+            }
