@@ -1,0 +1,9 @@
+{
+  "$comment": [
+    "Fixture for .github/workflows/test-cli.yml: a repository that pins its beplus CLI.",
+    "2.10.0 on purpose, NOT the newest release: a run that floated on `be latest`",
+    "instead of honouring the pin cannot pass by accident."
+  ],
+  "environments": ["dev"],
+  "cli": { "version": "2.10.0" }
+}

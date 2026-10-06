@@ -1,0 +1,8 @@
+{
+  "$comment": [
+    "Fixture for .github/workflows/test-cli.yml: an estate manifest with no `cli`",
+    "section. The action keeps today's behaviour (`be latest`) and warns that the",
+    "repository floats."
+  ],
+  "environments": ["dev"]
+}

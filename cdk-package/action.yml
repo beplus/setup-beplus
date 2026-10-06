@@ -77,12 +77,13 @@ inputs:
     default: us-east-1
   cli-version:
     description: >-
-      Which beplus CLI to install. ⚠️ `latest` resolves to the newest FULL
-      release, which today is v1 — and the resolve/prune steps below call
-      `beplus infra`, which only exists in v2. Callers on v2 must pass an
-      explicit version until a v2 release is tagged.
+      Which beplus CLI to install. Empty (the default) installs the version the
+      repository pins in beplus.estate.json → cli.version (`be auto`, via the
+      `cli` action); without a pin it floats on `latest`, with a warning. A value
+      here wins over the pin. The resolve/prune steps below call `beplus infra`,
+      which only exists in v2.
     required: false
-    default: latest
+    default: ""
   npm-token:
     description: BE_NPM_TOKEN. A composite action cannot read `secrets`, so the caller passes it.
     required: true
@@ -113,6 +114,8 @@ runs:
     # @beplus/* lives on npm.beplus.cloud (routed by common/config/rush/.npmrc).
     # Without the token pnpm still gets HTTP 200 from the proxy — with a stub
     # body — and fails late and unhelpfully with ERR_PNPM_TARBALL_INTEGRITY.
+    # The same step installs the beplus CLI the repository pins (beplus.estate.json
+    # → cli.version, checked out above) unless `cli-version` overrides it.
     - name: Authenticate the @beplus scope
       uses: beplus/setup-beplus/cli@v2
       env:

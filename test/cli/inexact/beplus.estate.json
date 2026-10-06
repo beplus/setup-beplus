@@ -1,0 +1,9 @@
+{
+  "$comment": [
+    "Fixture for .github/workflows/test-cli.yml: a pin that is not an exact",
+    "version. `2` would float across every 2.x release, so it must fail the run,",
+    "never install the newest 2.x."
+  ],
+  "environments": ["dev"],
+  "cli": { "version": "2" }
+}

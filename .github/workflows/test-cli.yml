@@ -1,0 +1,113 @@
+# The `cli` action installs the beplus CLI the repository pins.
+# ---------------------------------------------------------------
+# A CLI release must never change what a repository's CI does without a commit in
+# that repository. So `cli` (and `cdk-package`, which calls it) installs the
+# version pinned in the nearest beplus.estate.json → cli.version via `be auto`,
+# and checks `beplus --version` against the pin before anything uses the CLI.
+#
+# Each leg runs THIS branch's action (`uses: ./cli`) on a fresh runner against a
+# fixture under test/cli, and asserts what `beplus --version` reports. The pinned
+# fixture pins 2.10.0 — not the newest release — so a run that floated on
+# `be latest` instead of honouring the pin cannot pass by accident.
+#
+# `be` itself comes from beplus/be@main, so the pinned legs go green once
+# `be auto` reads beplus.estate.json there.
+name: Test cli
+
+on:
+  pull_request:
+    paths:
+      - cli/**
+      - cdk-package/**
+      - test/cli/**
+      - .github/workflows/test-cli.yml
+  push:
+    branches: [main]
+    paths:
+      - cli/**
+      - cdk-package/**
+      - test/cli/**
+      - .github/workflows/test-cli.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pin:
+    name: ${{ matrix.case }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: a pin installs exactly the pinned version
+            dir: test/cli/pinned
+            expect: 2.10.0
+          - case: the nearest manifest pins a package below it
+            dir: test/cli/pinned/packages/app
+            expect: 2.10.0
+          - case: BE_CLI_VERSION wins over the pin
+            dir: test/cli/pinned
+            version: 2.9.0
+            expect: 2.9.0
+          - case: a manifest without a pin floats on latest
+            dir: test/cli/unpinned
+            expect: latest
+          - case: no manifest floats on latest
+            dir: ""
+            expect: latest
+          - case: an inexact pin fails the run
+            dir: test/cli/inexact
+            expect: failure
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A package directory with no manifest of its own: `be auto` must walk up
+      # to test/cli/pinned, the way it does from packages/apps/* in an estate.
+      - name: Make a package directory below the pinned manifest
+        run: mkdir -p test/cli/pinned/packages/app
+
+      - name: Setup beplus CLI
+        id: setup
+        uses: ./cli
+        continue-on-error: ${{ matrix.expect == 'failure' }}
+        with:
+          BE_CLI_VERSION: ${{ matrix.version }}
+          # Empty `dir` = a directory with no beplus.estate.json at or above it.
+          BE_WORKING_DIRECTORY: ${{ matrix.dir || runner.temp }}
+
+      - name: Assert the installed version
+        shell: bash
+        env:
+          EXPECT: ${{ matrix.expect }}
+          OUTCOME: ${{ steps.setup.outcome }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EXPECT" == failure ]]; then
+            if [[ "$OUTCOME" != failure ]]; then
+              echo "::error::The action accepted a pin that is not an exact version (outcome: $OUTCOME)."
+              exit 1
+            fi
+            echo "The action refused the inexact pin, as it must."
+            exit 0
+          fi
+
+          if [[ "$EXPECT" == latest ]]; then
+            EXPECT="$(be --latest)"
+            EXPECT="${EXPECT#v}"
+          fi
+
+          out="$(beplus --version)"
+          echo "$out"
+          installed=""
+          if [[ "$out" =~ ([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?) ]]; then
+            installed="${BASH_REMATCH[1]}"
+          fi
+          if [[ "$installed" != "$EXPECT" ]]; then
+            echo "::error::beplus --version reports ${installed:-nothing}, expected $EXPECT."
+            exit 1
+          fi
+          echo "beplus CLI $installed, as expected."

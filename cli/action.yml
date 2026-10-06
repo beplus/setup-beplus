@@ -1,10 +1,14 @@
 name: "Setup beplus CLI"
-description: "Install and verify beplus CLI + authenticate npm for beplus.cloud packages"
+description: "Install and verify the beplus CLI the repository pins (beplus.estate.json → cli.version) + authenticate npm for beplus.cloud packages"
 inputs:
   BE_CLI_VERSION:
-    description: "Version of beplus CLI to install (default: latest)"
+    description: >-
+      Version of beplus CLI to install, passed to `be` (e.g. 2.11.0, 2, latest).
+      Empty (the default) installs the version the repository pins in the nearest
+      beplus.estate.json → cli.version, via `be auto`; a repository without a pin
+      gets `latest`, with a warning that it floats. A value here wins over the pin.
     required: false
-    default: "latest"
+    default: ""
   BE_NPM_AUTH:
     description: "Authenticate beplus.cloud NPM? (requires BE_NPM_TARGET and BE_NPM_TOKEN env vars)"
     required: false
@@ -12,6 +16,13 @@ inputs:
   BE_PREFIX:
     description: "Install prefix for beplus binaries (must be writable)."
     required: false
+  BE_WORKING_DIRECTORY:
+    description: >-
+      Where the pin is looked up: the nearest beplus.estate.json at or above this
+      directory, exactly as `be auto` finds it. Relative to the workspace.
+      Default: the workspace (check the repository out first).
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -32,18 +43,113 @@ runs:
         echo "BE_PREFIX=$BE_PREFIX" >> "$GITHUB_ENV"
         echo "$BE_PREFIX/bin" >> "$GITHUB_PATH"
 
-    - name: Install beplus CLI
+    # Which CLI this run gets. A CLI release must never change what a repository's
+    # CI does without a commit in that repository, so the version comes from the
+    # pin the repository commits — not from whatever was released this morning.
+    #
+    # This step only decides WHETHER there is a pin. Resolving and validating it
+    # is `be auto`'s job (one implementation, the same one a laptop and a Docker
+    # build run); the pin read here is kept to prove, after the install, that
+    # `be auto` installed exactly it.
+    - name: Choose the beplus CLI version
+      id: choose
       shell: bash
+      working-directory: ${{ inputs.BE_WORKING_DIRECTORY || github.workspace }}
+      env:
+        INPUT_VERSION: ${{ inputs.BE_CLI_VERSION }}
       run: |
         set -euo pipefail
-        be ${{ inputs.BE_CLI_VERSION }}
+
+        # The nearest beplus.estate.json at or above this directory — the same
+        # walk `be auto` does.
+        manifest=""
+        dir="$PWD"
+        while :; do
+          if [[ -e "$dir/beplus.estate.json" ]]; then
+            manifest="$dir/beplus.estate.json"
+            break
+          fi
+          [[ "$dir" == "/" || -z "$dir" ]] && break
+          dir="$(dirname "$dir")"
+        done
+        # Annotations point at the file relative to the repository when they can.
+        file="${manifest#"$GITHUB_WORKSPACE"/}"
+
+        pin=""
+        if [[ -n "$manifest" ]]; then
+          command -v jq > /dev/null || { echo "::error::jq is required to read the beplus CLI pin from $manifest."; exit 1; }
+          # A manifest that cannot be read is not "no pin": fail, never float.
+          if ! pin="$(jq -r '.cli.version // empty' "$manifest")"; then
+            echo "::error file=$file::Cannot read cli.version from $manifest (invalid JSON, or \"cli\" is not an object)."
+            exit 1
+          fi
+          if [[ "$pin" =~ [[:space:]] ]]; then
+            echo "::error file=$file::cli.version in $manifest is not a version: \"$pin\"."
+            exit 1
+          fi
+        fi
+
+        version="$INPUT_VERSION"
+        floating=""
+        if [[ -n "$INPUT_VERSION" ]]; then
+          if [[ -n "$pin" && "${INPUT_VERSION#v}" != "${pin#v}" ]]; then
+            echo "::warning file=$file::BE_CLI_VERSION=$INPUT_VERSION overrides the beplus CLI $pin pinned in $manifest."
+          fi
+          pin=""
+          echo "Installing beplus CLI $INPUT_VERSION (BE_CLI_VERSION)."
+        elif [[ -n "$pin" ]]; then
+          version="auto"
+          echo "Installing beplus CLI $pin, pinned in $manifest (be auto)."
+        else
+          # Today's behaviour, said out loud.
+          version="latest"
+          floating="${manifest:-no beplus.estate.json at or above $PWD}"
+          echo "No beplus CLI pin ($floating): installing latest."
+        fi
+
+        {
+          echo "version=$version"
+          echo "pin=$pin"
+          echo "manifest=$manifest"
+          echo "floating=$floating"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Install beplus CLI
+      shell: bash
+      working-directory: ${{ inputs.BE_WORKING_DIRECTORY || github.workspace }}
+      env:
+        VERSION: ${{ steps.choose.outputs.version }}
+      run: |
+        set -euo pipefail
+        be "$VERSION"
 
     - name: Verify beplus CLI version
       shell: bash
+      env:
+        PIN: ${{ steps.choose.outputs.pin }}
+        MANIFEST: ${{ steps.choose.outputs.manifest }}
+        FLOATING: ${{ steps.choose.outputs.floating }}
       run: |
         set -euo pipefail
+        out="$(beplus --version)"
         echo "beplus CLI version:"
-        beplus --version
+        echo "$out"
+
+        installed=""
+        if [[ "$out" =~ ([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?) ]]; then
+          installed="${BASH_REMATCH[1]}"
+        fi
+        file="${MANIFEST#"$GITHUB_WORKSPACE"/}"
+
+        # A pinned run installs the pin or fails — never "something close to it".
+        if [[ -n "$PIN" && "$installed" != "${PIN#v}" ]]; then
+          echo "::error file=$file::$MANIFEST pins beplus CLI $PIN, but \`be auto\` installed ${installed:-an unknown version}."
+          exit 1
+        fi
+
+        if [[ -n "$FLOATING" ]]; then
+          echo "::warning${MANIFEST:+ file=$file}::This repository does not pin the beplus CLI ($FLOATING), so its CI floats on \`be latest\` — every CLI release changes it without a commit here. Pin it: add \"cli\": { \"version\": \"${installed:-x.y.z}\" } to beplus.estate.json."
+        fi
 
     - name: beplus npm auth
       if: ${{ inputs.BE_NPM_AUTH == 'true'}}
