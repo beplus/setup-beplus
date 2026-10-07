@@ -1,0 +1,321 @@
+# Do the live databases still match the migrations? — once.
+# ---------------------------------------------------------
+# ironmountain-cz/monorepo (91 lines) and mrkithq/monorepo (105) each carried a
+# copy of this file; bepluscloud/ai had none. It verifies that each environment's
+# database structurally matches the committed migrations (drizzle/schema.sql) and
+# the next environment in the promotion order. SEPARATE from the pull-request
+# gate (db-migrations-pr.yml) because it needs connection secrets — it never
+# runs on a pull request.
+#
+# The comparison is the repository's own `beplus db diff` (@beplus/database-tools,
+# resolved from the repository's install), where the copies ran `npm run db:diff`
+# over a `bin/db-diff.ts` copy of their own; it prints what that printed, line
+# for line (BE-231's golden harness is the proof). What the copies wrote out by
+# hand comes from beplus.estate.json:
+#
+#   the rush project    → `database.package` (default packages/modules/database)
+#                         and its package.json `name`; the `project` input wins
+#   the environments    dev, prod (each copy's list)
+#                       → beplus.estate.json `environments`; the `environments`
+#                         input wins (MRKIT passes `dev prod` until its stage
+#                         database exists)
+#
+# and the guard and the drift step loop over that list. For the copies' two
+# environments they print exactly what the copies printed and exit as they did —
+# `scripts/verify-callers.mjs db` runs both side by side to prove it. Every other
+# step body is byte-identical, bar the CLI version — the copies installed
+# `latest`; empty now installs the repository's pin (beplus.estate.json →
+# cli.version, `be auto`; BE-213), and `vars.BE_CLI_VERSION` still wins when it
+# is set — and the registry check after `beplus npm auth` (`BE_NPM_CHECK`). The
+# copy's `rush build` is gone: `beplus db diff` builds nothing it reads.
+#
+# Connection strings (read-capable): BE_POSTGRES_URL_DEV, BE_POSTGRES_URL_STAGE,
+# BE_POSTGRES_URL_PROD — secrets, as in the copies. Repository secrets, or
+# environment secrets of the environment named in `github-environment` (MRKIT's
+# live on `dev`, beside BE_NPM_TOKEN). The diff prints only masked URLs; raw
+# connection strings are never logged. A missing one fails the guard loudly
+# rather than reporting "no drift".
+#
+# The trigger stays in the repository — the nightly schedule and the manual run:
+#
+#   name: DB Drift (dev/prod)
+#   on:
+#     workflow_dispatch:
+#     schedule:
+#       - cron: "0 6 * * *" # 06:00 UTC nightly
+#   permissions:
+#     contents: read
+#   concurrency:
+#     group: db-drift-env-${{ github.workflow }}
+#     cancel-in-progress: false
+#   jobs:
+#     drift:
+#       uses: beplus/setup-beplus/.github/workflows/db-drift-env.yml@v2
+#       secrets: inherit
+#
+# It only reads: `beplus db diff` dumps the schemas (pg_dump, structure only) and
+# compares them. Nothing here migrates, writes or connects with more than the
+# secrets' read-capable roles.
+#
+# NO AWS ROLE, YET. The connection strings are secrets because nothing else
+# reaches a database from GitHub today: no account has a database-read OIDC
+# role (GitHubOIDCStack trusts cdk-diff, cdk-deploy and provisioning only), and
+# `beplus db diff` reads BE_POSTGRES_URL_<ENV> — it does not open the ECS-Exec
+# tunnel `beplus db migrate --env` uses to reach a private instance. Once both
+# exist (the GitHub OIDC construct in @beplus/cdk-estate, and `db diff` through
+# the tunnel), this job assumes that read role per environment instead, and the
+# secrets go.
+#
+# See cli_v2 EXTRACTION-PLAN.md, slice R2-4, and Linear BE-232.
+
+name: DB Drift
+
+on:
+  workflow_call:
+    inputs:
+      environments:
+        description: >-
+          The environments whose databases are compared — with the committed
+          migrations, and each with the next — space- or comma-separated, in
+          promotion order (e.g. `dev prod`). Each reads BE_POSTGRES_URL_<ENV>; dev,
+          stage and prod are mapped. Default: beplus.estate.json → `environments`.
+        required: false
+        type: string
+        default: ""
+      project:
+        description: >-
+          The Rush project of the database package — what `rush install --to`
+          names. Default: the package.json `name` of beplus.estate.json →
+          `database.package` (default packages/modules/database).
+        required: false
+        type: string
+        default: ""
+      github-environment:
+        description: >-
+          The GitHub environment the drift job claims, when the connection
+          strings and BE_NPM_TOKEN are environment secrets there (MRKIT: `dev`).
+          Empty (the default): none — they are repository secrets.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      BE_NPM_TOKEN:
+        description: npm.beplus.cloud token for the @beplus scope.
+        required: false
+      BE_POSTGRES_URL_DEV:
+        description: A read-capable connection string for dev's database.
+        required: false
+      BE_POSTGRES_URL_STAGE:
+        description: A read-capable connection string for stage's database.
+        required: false
+      BE_POSTGRES_URL_PROD:
+        description: A read-capable connection string for prod's database.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # What the copies wrote out by hand, read from the manifest that already
+  # holds it — validated here, because it comes from the repository's tree.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.database.outputs.package }}
+      project: ${{ steps.database.outputs.project }}
+      environments: ${{ steps.database.outputs.environments }}
+      label: ${{ steps.database.outputs.label }}
+      summary: ${{ steps.database.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the database package and the environments from the manifest
+        id: database
+        env:
+          INPUT_PROJECT: ${{ inputs.project }}
+          INPUT_ENVIRONMENTS: ${{ inputs.environments }}
+        run: |
+          set -euo pipefail
+          manifest=beplus.estate.json
+          if [ ! -f "$manifest" ]; then
+            echo "::error::No beplus.estate.json at the repository root: its \`database\` section says which package the comparison runs in."
+            exit 1
+          fi
+
+          # The same default `beplus db` applies (cli-plugin-database's section).
+          package="$(jq -r '.database.package // "packages/modules/database"' "$manifest")"
+          if ! [[ "$package" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] || [[ "/$package/" == */../* ]]; then
+            echo "::error file=$manifest::database.package \"$package\" is not a relative directory in this repository."
+            exit 1
+          fi
+          if [ ! -f "$package/package.json" ]; then
+            echo "::error file=$manifest::database.package is \"$package\", which has no package.json — set it to the directory of the repository's database package."
+            exit 1
+          fi
+
+          project="${INPUT_PROJECT:-$(jq -r '.name // empty' "$package/package.json")}"
+          if ! [[ "$project" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$ ]]; then
+            if [ -n "$INPUT_PROJECT" ]; then
+              echo "::error::the \`project\` input: \"$project\" is not a Rush project name."
+            else
+              echo "::error file=$package/package.json::\"$project\" is not a Rush project name."
+            fi
+            exit 1
+          fi
+
+          if [ -n "$INPUT_ENVIRONMENTS" ]; then
+            list="$(printf '%s' "$INPUT_ENVIRONMENTS" | tr ',' ' ')"
+            source="::error::the \`environments\` input:"
+          else
+            list="$(jq -r '(.environments // []) | map(tostring) | join(" ")' "$manifest")"
+            source="::error file=$manifest::environments:"
+          fi
+          environments=""
+          for env in $list; do
+            # The job maps these three connection strings and no others.
+            case "$env" in
+              dev | stage | prod) ;;
+              *)
+                echo "$source \"$env\" — the drift job reads BE_POSTGRES_URL_DEV, _STAGE and _PROD, and no connection string for \"$env\"."
+                exit 1
+                ;;
+            esac
+            case " $environments " in *" $env "*) continue ;; esac
+            environments="${environments:+$environments }$env"
+          done
+          if [ -z "$environments" ]; then
+            echo "::error file=$manifest::No environment to compare: pass \`environments\`, or list them in beplus.estate.json → environments."
+            exit 1
+          fi
+
+          # "dev vs prod" and "migrations, dev, and prod are structurally 1:1:1",
+          # the copies' words, for any number of environments.
+          read -r -a envs <<< "$environments"
+          label="${environments// / vs }"
+          ratio="1"
+          for env in "${envs[@]}"; do ratio="$ratio:1"; done
+          if [ "${#envs[@]}" -eq 1 ]; then
+            summary="migrations and ${envs[0]} are structurally $ratio"
+          else
+            summary="migrations"
+            for env in "${envs[@]:0:${#envs[@]}-1}"; do summary="$summary, $env"; done
+            summary="$summary, and ${envs[-1]} are structurally $ratio"
+          fi
+
+          echo "database package $package ($project); environments: $environments"
+          {
+            echo "package=$package"
+            echo "project=$project"
+            echo "environments=$environments"
+            echo "label=$label"
+            echo "summary=$summary"
+          } >> "$GITHUB_OUTPUT"
+
+  drift:
+    name: structural drift (migrations vs ${{ needs.plan.outputs.label }})
+    needs: plan
+    runs-on: ubuntu-latest
+    # Where the connection strings and BE_NPM_TOKEN are environment secrets
+    # (MRKIT: `dev`), the job claims that environment to see them. Empty: none.
+    environment: ${{ inputs.github-environment }}
+    timeout-minutes: 20
+
+    env:
+      BE_POSTGRES_URL_DEV: ${{ secrets.BE_POSTGRES_URL_DEV }}
+      BE_POSTGRES_URL_STAGE: ${{ secrets.BE_POSTGRES_URL_STAGE }}
+      BE_POSTGRES_URL_PROD: ${{ secrets.BE_POSTGRES_URL_PROD }}
+      # A pinned pg16 client via docker. WHICH image is the repository's:
+      # beplus.estate.json → database.dumpImage, else @beplus/database-tools' pin
+      # (pgvector/pgvector:pg16) — so it is not written here.
+      BE_PGDUMP_ENGINE: docker
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.14
+
+      - name: Cache Rush and pnpm
+        uses: actions/cache@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ runner.os }}-${{ runner.arch }}-rush-${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rush-
+
+      # @beplus/* lives on npm.beplus.cloud; see db-migrations-pr.yml for why
+      # the scope has to be authenticated before install. The same step installs
+      # the beplus CLI the repository pins (beplus.estate.json → cli.version).
+      - name: Authenticate the @beplus scope
+        uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
+          BE_NPM_AUTH: true
+          # ⚠️ AND PROVE IT WORKED. npm.beplus.cloud answers a read it cannot
+          # authenticate with HTTP 200 and a stub body, never 401, so a token
+          # that did not reach this job fails nothing until pnpm, minutes later,
+          # reports ERR_PNPM_TARBALL_INTEGRITY, then ERR_PNPM_NO_VERSIONS. This
+          # asks the registry for every @beplus package the database package
+          # depends on, and fails here, naming the cause.
+          BE_NPM_CHECK: ${{ needs.plan.outputs.package }}
+
+      # Every environment's connection string, or nothing runs: a missing one is
+      # a failure, never "no drift". The message names all of them, as the
+      # copies' did.
+      - name: Guard — secrets present
+        id: guard
+        env:
+          ENVIRONMENTS: ${{ needs.plan.outputs.environments }}
+        run: |
+          missing=0
+          names=""
+          for env in $ENVIRONMENTS; do
+            variable="BE_POSTGRES_URL_$(printf '%s' "$env" | tr '[:lower:]' '[:upper:]')"
+            names="${names:+$names / }$variable"
+            [ -n "${!variable:-}" ] || missing=1
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$names secrets are not set"
+            exit 1
+          fi
+
+      # `beplus db diff` needs the repository's @beplus/database-tools installed —
+      # and nothing built: it reads the committed schema file and the databases,
+      # no compiled schema (MRKIT's copy built anyway; Mountaineer's did not).
+      - name: Rush install
+        run: node common/scripts/install-run-rush.js install --to ${{ needs.plan.outputs.project }}
+
+      # Run every comparison and aggregate, so one failure doesn't hide the others.
+      # migrations = committed drizzle/schema.sql (canonical "what migrations produce");
+      # then each environment against the next one in the promotion order.
+      - name: Structural drift (migrations vs ${{ needs.plan.outputs.label }})
+        id: drift
+        working-directory: ${{ needs.plan.outputs.package }}
+        env:
+          ENVIRONMENTS: ${{ needs.plan.outputs.environments }}
+          SUMMARY: ${{ needs.plan.outputs.summary }}
+        run: |
+          set +e
+          rc=0
+          for env in $ENVIRONMENTS; do
+            echo "::group::migrations vs $env"; beplus db diff migrations "$env"; [ $? -ne 0 ] && rc=1; echo "::endgroup::"
+          done
+          previous=""
+          for env in $ENVIRONMENTS; do
+            if [ -n "$previous" ]; then
+              echo "::group::$previous vs $env"; beplus db diff "$previous" "$env"; [ $? -ne 0 ] && rc=1; echo "::endgroup::"
+            fi
+            previous="$env"
+          done
+          if [ $rc -ne 0 ]; then
+            echo "::error::Structural drift detected — see the grouped diffs above"
+          else
+            echo "✓ $SUMMARY"
+          fi
+          exit $rc

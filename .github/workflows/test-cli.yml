@@ -12,6 +12,10 @@
 #
 # `be` itself comes from beplus/be@main, so the pinned legs go green once
 # `be auto` reads beplus.estate.json there.
+#
+# BE_NPM_CHECK: with no token the auth is skipped and npm.beplus.cloud answers
+# the @beplus read with HTTP 200 and its stub body, so the check must fail the
+# run — before any install would have.
 name: Test cli
 
 on:
@@ -60,6 +64,10 @@ jobs:
           - case: an inexact pin fails the run
             dir: test/cli/inexact
             expect: failure
+          - case: the registry check fails on the anonymous stub
+            dir: test/cli/pinned
+            npm-check: test/cli/npm-check
+            expect: failure
 
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +77,11 @@ jobs:
       - name: Make a package directory below the pinned manifest
         run: mkdir -p test/cli/pinned/packages/app
 
+      # The scope mapped, no token: what a job that BE_NPM_TOKEN never reached sees.
+      - name: Map @beplus without a token
+        if: ${{ matrix.npm-check }}
+        run: echo "@beplus:registry=https://npm.beplus.cloud/" >> ~/.npmrc
+
       - name: Setup beplus CLI
         id: setup
         uses: ./cli
@@ -77,10 +90,13 @@ jobs:
           BE_CLI_VERSION: ${{ matrix.version }}
           # Empty `dir` = a directory with no beplus.estate.json at or above it.
           BE_WORKING_DIRECTORY: ${{ matrix.dir || runner.temp }}
+          BE_NPM_AUTH: ${{ matrix.npm-check && 'true' || 'false' }}
+          BE_NPM_CHECK: ${{ matrix.npm-check }}
 
       - name: Assert the installed version
         shell: bash
         env:
+          CASE: ${{ matrix.case }}
           EXPECT: ${{ matrix.expect }}
           OUTCOME: ${{ steps.setup.outcome }}
         run: |
@@ -88,10 +104,10 @@ jobs:
 
           if [[ "$EXPECT" == failure ]]; then
             if [[ "$OUTCOME" != failure ]]; then
-              echo "::error::The action accepted a pin that is not an exact version (outcome: $OUTCOME)."
+              echo "::error::The action did not fail — $CASE (outcome: $OUTCOME)."
               exit 1
             fi
-            echo "The action refused the inexact pin, as it must."
+            echo "The action failed, as it must: $CASE."
             exit 0
           fi
 

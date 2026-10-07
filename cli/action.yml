@@ -13,6 +13,17 @@ inputs:
     description: "Authenticate beplus.cloud NPM? (requires BE_NPM_TARGET and BE_NPM_TOKEN env vars)"
     required: false
     default: "false"
+  BE_NPM_CHECK:
+    description: >-
+      Package directories (space- or newline-separated, relative to the workspace)
+      whose @beplus dependencies must come back from the registry as real packages
+      after `beplus npm auth`. npm.beplus.cloud answers a read it cannot
+      authenticate with HTTP 200 and a stub body — never 401 — so without this a
+      token that did not reach the job fails nothing until pnpm, minutes later,
+      reports ERR_PNPM_TARBALL_INTEGRITY. Needs npm and jq. Empty (the default):
+      no check.
+    required: false
+    default: ""
   BE_PREFIX:
     description: "Install prefix for beplus binaries (must be writable)."
     required: false
@@ -163,3 +174,71 @@ runs:
         else
           echo "Skipping beplus npm auth (BE_NPM_AUTH=${{ inputs.BE_NPM_AUTH }} because one of (BE_NPM_TARGET,BE_NPM_TOKEN) is missing."
         fi
+
+    # ⚠️ THE REGISTRY NEVER SAYS NO. npm.beplus.cloud answers a read it cannot
+    # authenticate with HTTP 200 and a stub body — {"status":200,"message":"OK"}
+    # — never 401, and the step above skips the auth (saying so in its log) when
+    # BE_NPM_TARGET or BE_NPM_TOKEN did not reach the job. `npm view` then prints
+    # nothing and exits 0; pnpm fails minutes later with ERR_PNPM_TARBALL_INTEGRITY,
+    # then ERR_PNPM_NO_VERSIONS. So ask, through the registry the install will use,
+    # for every @beplus package the named packages depend on, and fail here,
+    # naming the cause.
+    - name: Check the @beplus registry serves real packages
+      if: ${{ inputs.BE_NPM_CHECK != '' }}
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        CHECK: ${{ inputs.BE_NPM_CHECK }}
+      run: |
+        set -euo pipefail
+        command -v npm > /dev/null || { echo "::error::BE_NPM_CHECK needs npm on PATH (actions/setup-node first)."; exit 1; }
+        command -v jq > /dev/null || { echo "::error::BE_NPM_CHECK needs jq on PATH."; exit 1; }
+
+        # The registry Rush hands pnpm for the scope; else npm's own (~/.npmrc,
+        # which `beplus npm auth` wrote).
+        registry="$(sed -n 's/^[[:space:]]*@beplus:registry[[:space:]]*=[[:space:]]*//p' common/config/rush/.npmrc 2> /dev/null | tail -n 1 | tr -d '[:space:]')" || registry=""
+        scope=()
+        if [[ "$registry" =~ ^https?://[^[:space:]\$]+$ ]]; then
+          scope=("--@beplus:registry=$registry")
+        else
+          registry="$(npm config get @beplus:registry)"
+          [ "$registry" != undefined ] || registry="npm's default registry (nothing maps @beplus)"
+        fi
+
+        # Each package's direct @beplus dependencies. A workspace project is
+        # built, not fetched.
+        deps=""
+        for dir in $CHECK; do
+          if [ ! -f "$dir/package.json" ]; then
+            echo "::error::BE_NPM_CHECK: $dir has no package.json."
+            exit 1
+          fi
+          deps+="$(jq -r '
+            [.dependencies, .devDependencies, .optionalDependencies]
+            | map(objects | to_entries[]) | .[]
+            | select((.key | startswith("@beplus/")) and ((.value | tostring) | startswith("workspace:") | not))
+            | .key' "$dir/package.json")"$'\n'
+        done
+        mapfile -t wanted < <(printf '%s' "$deps" | sed '/^$/d' | sort -u)
+        if [ "${#wanted[@]}" -eq 0 ]; then
+          echo "Nothing in @beplus to check ($CHECK)."
+          exit 0
+        fi
+
+        failed=0
+        for pkg in "${wanted[@]}"; do
+          err="$(mktemp)"
+          rc=0
+          name="$(npm view "$pkg" name "${scope[@]}" 2> "$err")" || rc=$?
+          if [ "$rc" -eq 0 ] && [ "$name" = "$pkg" ]; then
+            echo "✓ $pkg — a real package on $registry"
+          elif [ "$rc" -ne 0 ]; then
+            failed=1
+            echo "::error::$pkg: $(grep -m 1 -E '^npm (error|ERR!) [0-9]{3} ' "$err" || grep -m 1 -E '^npm (error|ERR!)' "$err" || head -n 1 "$err")"
+          else
+            failed=1
+            echo "::error::$pkg: $registry answered with its anonymous stub (HTTP 200, no package). BE_NPM_TOKEN did not reach this job, or the registry refused it — a repository or organization secret reaches it; an environment secret only reaches a job that claims that environment."
+          fi
+          rm -f "$err"
+        done
+        exit "$failed"

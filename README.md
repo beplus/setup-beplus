@@ -133,6 +133,83 @@ CLI the repository pins (`cli.version`). `node scripts/verify-callers.mjs infra-
 --repo <estate>` proves a caller plus this workflow reproduce the file it replaced,
 step for step.
 
+An estate's database gates are two more. MRKIT and Mountaineer each carried
+`db-migrations-pr.yml` (146 / 137 lines) and `db-drift-env.yml` (105 / 91);
+bepluscloud had neither. Both now run the repository's own `beplus db` commands —
+`@beplus/database-tools`, resolved from the repository's install, never bundled
+in the CLI — over `beplus.estate.json`'s `database` section:
+
+- **`db-migrations-pr.yml`** — on a pull request: a pgvector Postgres service
+  (`pgvector/pgvector:0.8.7-pg16`), the pinned CLI, `beplus npm auth` with the
+  stub-200 registry check (`BE_NPM_CHECK`, below), `rush install` / `rush build
+  --to <the database project>`, then `beplus db check`, `db check pending`,
+  `db check chains` and `db check rebuild --compare`. It reaches no database but
+  its own service.
+- **`db-drift-env.yml`** — nightly and on demand: `beplus db diff migrations
+  <env>` for each environment, then each environment against the next, all
+  aggregated so one drift does not hide another. Connection strings are the
+  secrets `BE_POSTGRES_URL_DEV` / `_STAGE` / `_PROD`, as before; there is no
+  database-read OIDC role in any account yet, nor a `db diff` through the tunnel,
+  so it assumes no AWS role.
+
+The rush project (`database.package` → its package.json `name`), the test
+database (`naming.prefix` + `_test`) and the environments (`environments`) come
+from the manifest; the inputs are for what cannot:
+
+| Input | Workflow | Default | |
+|---|---|---|---|
+| `github-environment` | both | none | The GitHub environment the job claims, when `BE_NPM_TOKEN` (and the connection strings) are environment secrets there — MRKIT: `dev` |
+| `environments` | drift | `beplus.estate.json` → `environments` | e.g. `dev prod`; dev, stage and prod are mapped |
+| `project` | both | `database.package`'s package.json `name` | The Rush project to install (and build) |
+
+```yaml
+# .github/workflows/db-migrations-pr.yml — keep your own triggers
+name: DB Migrations (PR-safe)
+on:
+  pull_request:
+    paths:
+      - "packages/modules/database/drizzle/**"
+      - ".github/workflows/db-migrations-pr.yml"
+      # … the schema sources, drizzle.config.ts, package.json
+permissions:
+  contents: read
+concurrency:
+  group: db-migrations-pr-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    uses: beplus/setup-beplus/.github/workflows/db-migrations-pr.yml@v2
+    secrets: inherit
+```
+
+```yaml
+# .github/workflows/db-drift-env.yml
+name: DB Drift (dev/prod)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+permissions:
+  contents: read
+concurrency:
+  group: db-drift-env-${{ github.workflow }}
+  cancel-in-progress: false
+jobs:
+  drift:
+    uses: beplus/setup-beplus/.github/workflows/db-drift-env.yml@v2
+    secrets: inherit
+```
+
+Keep the job ids (`checks`, `drift`): the check is then named
+`checks / migration integrity + rebuild` — a required status check that named
+`migration integrity + rebuild` has to be renamed once. The pinned CLI must bundle
+`@beplus/cli-plugin-database` with `db check pending | rebuild | chains` and the
+repository must have installed `@beplus/database-tools`; `beplus db` refuses
+cleanly otherwise. `node scripts/verify-callers.mjs db --repo <estate>` proves a
+caller plus these workflows reproduce the files it replaced: it runs the shared
+plan step on the estate's own manifest, compares every job and step, and runs the
+drift job's rewritten guard and comparison side by side with the copies'.
+
 A repository's docs site — `@beplus/docs-site` from beplus/docs — is built and
 published to GitHub Pages by one more:
 
