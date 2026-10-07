@@ -1,0 +1,10 @@
+{
+  "name": "npm-check-fixture",
+  "private": true,
+  "dependencies": {
+    "@beplus/configuration": "0.127.0"
+  },
+  "devDependencies": {
+    "@beplus/fixture-local": "workspace:*"
+  }
+}

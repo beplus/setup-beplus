@@ -13,6 +13,7 @@ Composite GitHub Action that installs [@beplus/be](https://github.com/beplus/be)
    - otherwise → `be latest`, as before, with a `::warning::` that the repository floats
 3. Verifies `beplus --version` — and, for a pinned run, fails unless it is exactly the pinned version
 4. Optionally runs `beplus npm auth` if enabled and required environment variables are present
+5. Optionally (`BE_NPM_CHECK`) proves the registry then serves real `@beplus` packages — see [The registry never says no](#the-registry-never-says-no)
 
 ---
 
@@ -22,6 +23,7 @@ Composite GitHub Action that installs [@beplus/be](https://github.com/beplus/be)
 |------|----------|---------|-------------|
 | `BE_CLI_VERSION` | No | empty | Version or channel of beplus CLI to install (passed to `be`). Empty installs the repository's pin (`be auto`), or `latest` with a warning when there is none. A value here wins over the pin. |
 | `BE_NPM_AUTH` | No | `false` | If `true`, runs `beplus npm auth` |
+| `BE_NPM_CHECK` | No | empty | Package directories (space- or newline-separated, relative to the workspace) whose `@beplus` dependencies must come back from the registry as real packages. Needs `npm` and `jq`. Empty: no check. |
 | `BE_PREFIX` | No | empty | Install prefix for beplus binaries. If empty, defaults to `$HOME/.beplus`. Must be writable. |
 | `BE_WORKING_DIRECTORY` | No | the workspace | Where the pin is looked up: the nearest `beplus.estate.json` at or above this directory, exactly as `be auto` finds it. Relative to the workspace. |
 
@@ -81,6 +83,40 @@ Required only when `BE_NPM_AUTH` is set to `"true"`:
 `beplus npm auth` runs **only if**:
 - `BE_NPM_AUTH == "true"`
 - both `BE_NPM_TARGET` and `BE_NPM_TOKEN` are present
+
+Otherwise it is skipped, and says so in the log — which is not an error, and
+that is the trap below.
+
+### The registry never says no
+
+npm.beplus.cloud answers a read it cannot authenticate with **HTTP 200 and a stub
+body** (`{"status":200,"message":"OK"}`), never 401. So a token that did not
+reach the job — an environment secret in a job that claims no environment, a
+fork's pull request — fails nothing here: `npm view` prints nothing and exits 0,
+and pnpm fails minutes later with `ERR_PNPM_TARBALL_INTEGRITY`, then
+`ERR_PNPM_NO_VERSIONS`.
+
+`BE_NPM_CHECK` closes that gap. After the auth, it asks the registry for every
+`@beplus` dependency of the packages you name (`dependencies`,
+`devDependencies`, `optionalDependencies`; `workspace:` ones are skipped) —
+through the registry Rush hands pnpm (`common/config/rush/.npmrc`), else npm's
+own — and fails the step unless each comes back as a real package, naming the
+cause: the stub (no token, or a refused one), or npm's own error (a 404 for a
+package that is not published).
+
+```yaml
+- uses: actions/setup-node@v6
+  with:
+    node-version: 22.14
+
+- uses: beplus/setup-beplus/cli@v2
+  env:
+    BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+    BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+  with:
+    BE_NPM_AUTH: true
+    BE_NPM_CHECK: packages/modules/database
+```
 
 ---
 
