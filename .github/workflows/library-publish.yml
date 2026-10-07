@@ -170,7 +170,7 @@ jobs:
           BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
           BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
         with:
-          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION || 'latest' }}
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
           BE_NPM_AUTH: true
 
       - name: Install the Dependencies
@@ -611,7 +611,7 @@ jobs:
       # ~/.npmrc. Nothing here installs, so no npm.beplus.cloud token is needed.
       - uses: beplus/setup-beplus/cli@v2
         with:
-          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION || 'latest' }}
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
 
       - name: Authenticate with AWS CodeArtifact
         run: beplus aws codeartifact auth --env "${BE_ENVIRONMENT}"

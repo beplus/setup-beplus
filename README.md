@@ -7,12 +7,14 @@ Composite GitHub Action collection for setting up the beplus Environment in GitH
 ## Available Actions
 
 ### [`cli`](./cli/README.md)
-Installs the beplus CLI (`@beplus/be` and `beplus`) with optional npm authentication.
+Installs the beplus CLI (`@beplus/be` and `beplus`) with optional npm authentication —
+the version the repository pins in `beplus.estate.json` → `cli.version` (`be auto`).
+A repository without a pin gets `latest` and a warning that it floats; see
+[Pinning the CLI](./cli/README.md#pinning-the-cli).
 
 ```yaml
 - uses: beplus/setup-beplus/cli@v2
   with:
-    BE_CLI_VERSION: latest
     BE_NPM_AUTH: false
 ```
 
@@ -94,6 +96,120 @@ and stage and prod publish those same bytes — never a build of their own:
 
 They install nothing, so they need no `BE_NPM_TOKEN`.
 
+An estate's pull-request `cdk diff` — one sticky comment per CDK app — is one more.
+The three estates carried a 186-line copy each; the role, the region and the
+comment marker were the only differences, and all three are derived (the role
+`github-actions-<owner>-<repo>-<env>-cdk-diff` from the calling repository, the
+region from `beplus.estate.json` → `defaultRegion`, the marker from `naming.product`),
+so it has no inputs. The trigger, the permissions and the concurrency group stay
+in the repository:
+
+```yaml
+# .github/workflows/infra-diff.yml
+name: infra diff
+on:
+  pull_request:
+    paths:
+      - "packages/aws/**"
+      - "packages/apps/<app>/.bepluscloud/**"
+      - ".github/workflows/infra-diff.yml"
+      - "beplus.estate.json"
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+concurrency:
+  group: infra-diff-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  infra-diff:
+    uses: beplus/setup-beplus/.github/workflows/infra-diff.yml@v2
+    secrets: inherit
+```
+
+It cannot deploy: the composite always runs in `mode: diff` as the read-only
+`…-cdk-diff` role, and nothing a caller passes can change either. It installs the
+CLI the repository pins (`cli.version`). `node scripts/verify-callers.mjs infra-diff
+--repo <estate>` proves a caller plus this workflow reproduce the file it replaced,
+step for step.
+
+An estate's database gates are two more. MRKIT and Mountaineer each carried
+`db-migrations-pr.yml` (146 / 137 lines) and `db-drift-env.yml` (105 / 91);
+bepluscloud had neither. Both now run the repository's own `beplus db` commands —
+`@beplus/database-tools`, resolved from the repository's install, never bundled
+in the CLI — over `beplus.estate.json`'s `database` section:
+
+- **`db-migrations-pr.yml`** — on a pull request: a pgvector Postgres service
+  (`pgvector/pgvector:0.8.7-pg16`), the pinned CLI, `beplus npm auth` with the
+  stub-200 registry check (`BE_NPM_CHECK`, below), `rush install` / `rush build
+  --to <the database project>`, then `beplus db check`, `db check pending`,
+  `db check chains` and `db check rebuild --compare`. It reaches no database but
+  its own service.
+- **`db-drift-env.yml`** — nightly and on demand: `beplus db diff migrations
+  <env>` for each environment, then each environment against the next, all
+  aggregated so one drift does not hide another. Connection strings are the
+  secrets `BE_POSTGRES_URL_DEV` / `_STAGE` / `_PROD`, as before; there is no
+  database-read OIDC role in any account yet, nor a `db diff` through the tunnel,
+  so it assumes no AWS role.
+
+The rush project (`database.package` → its package.json `name`), the test
+database (`naming.prefix` + `_test`) and the environments (`environments`) come
+from the manifest; the inputs are for what cannot:
+
+| Input | Workflow | Default | |
+|---|---|---|---|
+| `github-environment` | both | none | The GitHub environment the job claims, when `BE_NPM_TOKEN` (and the connection strings) are environment secrets there — MRKIT: `dev` |
+| `environments` | drift | `beplus.estate.json` → `environments` | e.g. `dev prod`; dev, stage and prod are mapped |
+| `project` | both | `database.package`'s package.json `name` | The Rush project to install (and build) |
+
+```yaml
+# .github/workflows/db-migrations-pr.yml — keep your own triggers
+name: DB Migrations (PR-safe)
+on:
+  pull_request:
+    paths:
+      - "packages/modules/database/drizzle/**"
+      - ".github/workflows/db-migrations-pr.yml"
+      # … the schema sources, drizzle.config.ts, package.json
+permissions:
+  contents: read
+concurrency:
+  group: db-migrations-pr-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    uses: beplus/setup-beplus/.github/workflows/db-migrations-pr.yml@v2
+    secrets: inherit
+```
+
+```yaml
+# .github/workflows/db-drift-env.yml
+name: DB Drift (dev/prod)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+permissions:
+  contents: read
+concurrency:
+  group: db-drift-env-${{ github.workflow }}
+  cancel-in-progress: false
+jobs:
+  drift:
+    uses: beplus/setup-beplus/.github/workflows/db-drift-env.yml@v2
+    secrets: inherit
+```
+
+Keep the job ids (`checks`, `drift`): the check is then named
+`checks / migration integrity + rebuild` — a required status check that named
+`migration integrity + rebuild` has to be renamed once. The pinned CLI must bundle
+`@beplus/cli-plugin-database` with `db check pending | rebuild | chains` and the
+repository must have installed `@beplus/database-tools`; `beplus db` refuses
+cleanly otherwise. `node scripts/verify-callers.mjs db --repo <estate>` proves a
+caller plus these workflows reproduce the files it replaced: it runs the shared
+plan step on the estate's own manifest, compares every job and step, and runs the
+drift job's rewritten guard and comparison side by side with the copies'.
+
 A repository's docs site — `@beplus/docs-site` from beplus/docs — is built and
 published to GitHub Pages by one more:
 
@@ -138,9 +254,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The version pinned in beplus.estate.json → cli.version
       - uses: beplus/setup-beplus/cli@v2
-        with:
-          BE_CLI_VERSION: latest
 
       - uses: beplus/setup-beplus/git@v2
 

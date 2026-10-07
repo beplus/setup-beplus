@@ -1,0 +1,273 @@
+# The pull-request gate for a database's migrations — once.
+# ---------------------------------------------------------
+# mrkithq/monorepo (146 lines) and ironmountain-cz/monorepo (137) each carried
+# a copy of this file; bepluscloud/ai had none. It catches the classes of
+# breakage a migrations-only, never-push database is exposed to:
+#   1. migration metadata corruption / out-of-order `when` (the silent-skip hazard)
+#   2. a TypeScript schema change committed WITHOUT its migration
+#   3. an embedded chain (@beplus/ai-db's beplus_ai, @beplus/analytics-db's
+#      analytics) that no longer resolves, or whose journal is unsound
+#   4. a clean database that can no longer be rebuilt from the committed
+#      migrations, or whose structure no longer matches drizzle/schema.sql
+#
+# The checks are the repository's own `beplus db` commands (@beplus/database-tools,
+# resolved from the repository's install, never bundled in the CLI), where the
+# copies ran `npm run db:check:*` scripts over `bin/db-*.ts` copies of their own.
+# They print what those scripts printed, line for line (@beplus/database-tools
+# holds that parity; BE-231's golden harness proves it), and they read what used
+# to be written out per repository from beplus.estate.json:
+#
+#   the rush project   @mrkit/database / @mountaineer/database / @bepluscloud/database
+#                      → `database.package` (default packages/modules/database)
+#                        and its package.json `name`; the `project` input wins
+#   the test database  mrkit_test / mcl_test / be_test
+#                      → `naming.prefix`, lower-cased, + `_test`
+#   the chains         → the product's own migrator declaration (`db check chains`)
+#
+# Every other step body is byte-identical to the copies, bar three deliberate
+# changes: the CLI version — `vars.BE_CLI_VERSION || '2'` floated on the newest
+# 2.x; empty now installs the repository's pin (beplus.estate.json →
+# cli.version, `be auto`; BE-213), and the variable still wins when it is set —
+# the registry check after `beplus npm auth` (`BE_NPM_CHECK`), and the Postgres
+# service pinned to pgvector 0.8.7 / pg16 instead of the floating `pg16`. The pin
+# must be a CLI that bundles @beplus/cli-plugin-database with
+# `db check pending | rebuild | chains`. `scripts/verify-callers.mjs db` proves
+# all of it, step for step.
+#
+# What stays in the repository is what is the repository's: when it runs (the
+# paths), the permissions it grants, the concurrency group — and, when its
+# BE_NPM_TOKEN is an environment secret, which environment holds it:
+#
+#   name: DB Migrations (PR-safe)
+#   on:
+#     pull_request:
+#       paths: ["packages/modules/database/drizzle/**", …, ".github/workflows/db-migrations-pr.yml"]
+#   permissions:
+#     contents: read
+#   concurrency:
+#     group: db-migrations-pr-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+#     cancel-in-progress: true
+#   jobs:
+#     checks:
+#       uses: beplus/setup-beplus/.github/workflows/db-migrations-pr.yml@v2
+#       with:
+#         github-environment: dev   # only where BE_NPM_TOKEN is an environment secret
+#       secrets: inherit
+#
+# It reaches NO database but the Postgres service it starts: BE_POSTGRES_URL is
+# localhost, no connection secret is read, and the only secret it uses is
+# BE_NPM_TOKEN, for the private registry. It needs no AWS credentials.
+#
+# See cli_v2 EXTRACTION-PLAN.md, slice R2-4, and Linear BE-232.
+
+name: DB Migrations (PR-safe)
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: >-
+          The Rush project of the database package — what `rush install --to` and
+          `rush build --to` name. Default: the package.json `name` of
+          beplus.estate.json → `database.package` (default
+          packages/modules/database), the package every `beplus db` command reads.
+        required: false
+        type: string
+        default: ""
+      github-environment:
+        description: >-
+          The GitHub environment the checks job claims, when BE_NPM_TOKEN is an
+          environment secret there (MRKIT: `dev`). Its branch policy must then
+          admit every branch this gate runs on. Empty (the default): none — the
+          token is a repository or organization secret.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      BE_NPM_TOKEN:
+        description: >-
+          npm.beplus.cloud token for the @beplus scope. `secrets: inherit` (or, for
+          an environment secret, `github-environment`) is all a caller passes.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # What the copies wrote out by hand, read from the manifest that already
+  # holds it. Both values come from the pull request's own tree, so both are
+  # validated here before any step pastes them.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.database.outputs.package }}
+      project: ${{ steps.database.outputs.project }}
+      database: ${{ steps.database.outputs.database }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the database package from the manifest
+        id: database
+        env:
+          INPUT_PROJECT: ${{ inputs.project }}
+        run: |
+          set -euo pipefail
+          manifest=beplus.estate.json
+          if [ ! -f "$manifest" ]; then
+            echo "::error::No beplus.estate.json at the repository root: its \`database\` section says which package the checks run over."
+            exit 1
+          fi
+
+          # The same default `beplus db` applies (cli-plugin-database's section).
+          package="$(jq -r '.database.package // "packages/modules/database"' "$manifest")"
+          if ! [[ "$package" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] || [[ "/$package/" == */../* ]]; then
+            echo "::error file=$manifest::database.package \"$package\" is not a relative directory in this repository."
+            exit 1
+          fi
+          if [ ! -f "$package/package.json" ]; then
+            echo "::error file=$manifest::database.package is \"$package\", which has no package.json — set it to the directory of the repository's database package."
+            exit 1
+          fi
+
+          project="${INPUT_PROJECT:-$(jq -r '.name // empty' "$package/package.json")}"
+          if ! [[ "$project" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$ ]]; then
+            if [ -n "$INPUT_PROJECT" ]; then
+              echo "::error::the \`project\` input: \"$project\" is not a Rush project name."
+            else
+              echo "::error file=$package/package.json::\"$project\" is not a Rush project name."
+            fi
+            exit 1
+          fi
+
+          # mrkit_test, mcl_test, be_test — the names the copies gave it.
+          prefix="$(jq -r '.naming.prefix // empty' "$manifest")"
+          database="$(printf '%s' "${prefix:-${GITHUB_REPOSITORY#*/}}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_' '_')_test"
+          if ! [[ "$database" =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; then
+            echo "::error file=$manifest::naming.prefix gives the test database \"$database\", which is not a Postgres identifier."
+            exit 1
+          fi
+
+          echo "database package $package ($project), test database $database"
+          {
+            echo "package=$package"
+            echo "project=$project"
+            echo "database=$database"
+          } >> "$GITHUB_OUTPUT"
+
+  checks:
+    name: migration integrity + rebuild
+    needs: plan
+    runs-on: ubuntu-latest
+    # Where BE_NPM_TOKEN is an environment secret (MRKIT: `dev`) the job has to
+    # claim the environment to see it, and the environment's branch policy must
+    # then admit every branch this gate runs on — it has no `branches` filter
+    # by design. Empty: no environment.
+    environment: ${{ inputs.github-environment }}
+    timeout-minutes: 25
+
+    # pgvector image is required — the baseline migration runs CREATE EXTENSION
+    # vector. Pinned, not `pg16`: the server a rebuild runs on must not change
+    # under a pull request (the test kit, @beplus/database/testing, pins the same).
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ needs.plan.outputs.database }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      BE_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/${{ needs.plan.outputs.database }}
+      # A pinned pg16 client via docker, so dumps match the committed
+      # drizzle/schema.sql byte-for-byte regardless of the runner's installed
+      # pg_dump. WHICH image is the repository's: beplus.estate.json →
+      # database.dumpImage, else @beplus/database-tools' pin
+      # (pgvector/pgvector:pg16) — the same choice a laptop's `beplus db` makes,
+      # so it is not written here (BE_PGDUMP_IMAGE would outrank the manifest).
+      BE_PGDUMP_ENGINE: docker
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.14
+
+      - name: Cache Rush and pnpm
+        uses: actions/cache@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ runner.os }}-${{ runner.arch }}-rush-${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rush-
+
+      # @beplus/* lives on npm.beplus.cloud; this writes the token into
+      # ~/.npmrc. The same step installs the beplus CLI the repository pins
+      # (beplus.estate.json → cli.version) — a v2 CLI, which `beplus db check`
+      # needs; `vars.BE_CLI_VERSION` still wins when it is set.
+      - name: Authenticate the @beplus scope
+        uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
+          BE_NPM_AUTH: true
+          # ⚠️ AND PROVE IT WORKED. npm.beplus.cloud answers a read it cannot
+          # authenticate with HTTP 200 and a stub body, never 401, so a token
+          # that did not reach this job fails nothing until pnpm, minutes later,
+          # reports ERR_PNPM_TARBALL_INTEGRITY, then ERR_PNPM_NO_VERSIONS. This
+          # asks the registry for every @beplus package the database package
+          # depends on, and fails here, naming the cause.
+          BE_NPM_CHECK: ${{ needs.plan.outputs.package }}
+
+      - name: Rush install
+        run: node common/scripts/install-run-rush.js install --to ${{ needs.plan.outputs.project }}
+
+      # ⚠️ INSTALL IS NOT ENOUGH. drizzle-kit reads dist/, including workspace
+      # dependencies' — Mountaineer's @beplus/postmark contributes tables.
+      # Without a build its dist/db is absent, drizzle-kit prints
+      # MODULE_NOT_FOUND, exits 0 anyway, and `db check pending` passes over a
+      # schema it never finished reading. MRKIT's copy always built; Mountaineer's
+      # did not, until it learnt this.
+      - name: Rush build
+        run: node common/scripts/install-run-rush.js build --to ${{ needs.plan.outputs.project }}
+
+      # 1) Pure file check — journal/snapshot integrity + the `when`-ordering guard
+      #    that catches a freshly-merged migration whose `when` slipped below an
+      #    earlier one (the silent-skip hazard). No database needed.
+      #    (The copies' `npm run db:check:collisions` was exactly this command.)
+      - name: Migration collision + ordering check
+        working-directory: ${{ needs.plan.outputs.package }}
+        run: beplus db check
+
+      # 2) The TS schema must not have changes that lack a committed migration.
+      - name: No pending (uncommitted) migration
+        working-directory: ${{ needs.plan.outputs.package }}
+        run: beplus db check pending
+
+      # 3) Every chain the product's migrator declaration embeds — @beplus/ai-db's
+      #    beplus_ai, @beplus/analytics-db's analytics — resolves, and its
+      #    journal is sound. Mountaineer's copy checked beplus_ai here; MRKIT's
+      #    checked neither of its two (only its local `db:check` did).
+      - name: Embedded migration chains check
+        id: chains
+        working-directory: ${{ needs.plan.outputs.package }}
+        run: beplus db check chains
+
+      # 4) A clean DB must rebuild from the migrations (every chain), AND the
+      #    rebuilt structure must match the committed drizzle/schema.sql.
+      #    If this fails only because the pinned pg16 image bumped minor versions,
+      #    regenerate it: `beplus db migrate --url <a fresh database>`, then
+      #    `beplus db schema dump --url <it> --write`.
+      - name: Rebuild from migrations + compare schema.sql
+        working-directory: ${{ needs.plan.outputs.package }}
+        run: beplus db check rebuild --compare
