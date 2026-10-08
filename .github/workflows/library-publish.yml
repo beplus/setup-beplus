@@ -113,6 +113,8 @@ jobs:
   #   - The version commit is not marked [skip ci]. GitHub skips a push whose head commit says so,
   #     and stage and prod promote by fast-forwarding to that commit. This job skips the run that
   #     commit starts on dev, by its message.
+  #   - The version commit and its tags are pushed before either registry sees a version, so a
+  #     version is only ever published from a commit that is on dev.
   release:
     name: Release on dev
     if: >-
@@ -123,7 +125,8 @@ jobs:
     environment: dev
 
     # One release at a time: two runs versioning at once would cut two versions from the same
-    # change files.
+    # change files. A run that queues behind another waits; a third replaces the one waiting, which
+    # loses nothing, because each run releases dev as it is when it starts, not its own commit.
     concurrency:
       group: library-release-dev
       cancel-in-progress: false
@@ -133,8 +136,14 @@ jobs:
       BE_PACKAGES: ${{ inputs.packages }}
 
     steps:
+      # dev as it is now, not the commit that started the run: a run that waited behind another must
+      # build on that run's version commit, and release every change merged since. Two commits deep,
+      # so a re-run that finds dev on a version commit can still see what that commit changed.
       - name: Checkout monorepo
         uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 2
 
       - name: Configure Git
         uses: beplus/setup-beplus/git@v2
@@ -206,6 +215,21 @@ jobs:
           else
             echo "has-changes=false" >> $GITHUB_OUTPUT
             echo "⚠️ No change files found"
+          fi
+
+      # The version commit is pushed before anything is published. If publishing then failed, dev
+      # ends on that commit with no change files left, and a re-run publishes the versions it carries
+      # (those a registry already has are skipped) and makes their releases.
+      - name: Decide what to publish
+        id: release
+        run: |
+          if [ "${{ steps.rush-change.outputs.has-changes }}" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif git log -1 --format=%s | grep -q '^chore: publish packages'; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "dev is a version commit: publishing the versions it carries."
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create a change file for forced mode
@@ -370,7 +394,7 @@ jobs:
         run: bash -c "$AFTER_VERSION"
 
       - name: Prepare packages
-        if: steps.rush-change.outputs.has-changes == 'true'
+        if: steps.release.outputs.publish == 'true'
         run: |
           PACKAGES_DIR="${GITHUB_WORKSPACE}/.packages"
           rm -rf "$PACKAGES_DIR"
@@ -385,10 +409,43 @@ jobs:
             --publish \
             --release-folder "$PACKAGES_DIR"
 
+      # Not [skip ci]: see the note above the job.
+      - name: Commit version changes
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          git add .
+          git commit -m "chore: publish packages"
+
+      - name: Create git tags from CHANGELOGs
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          # Find CHANGELOG.json files that were modified by rush version
+          git diff HEAD~1 --name-only | grep "CHANGELOG.json$" | while read changelog; do
+            if [ -f "$changelog" ]; then
+              tag=$(jq -r '.entries[0].tag // empty' "$changelog")
+              if [ -n "$tag" ]; then
+                echo "Creating tag: $tag"
+                git tag -a "$tag" -m "$tag"
+              fi
+            fi
+          done
+
+      # Pushed before anything is published, and atomically: the branch and its tags land together
+      # or not at all. Something merged to dev while this run built (two PRs merged a minute apart)
+      # rejects the push. Then nothing has been published and no tag is left behind, and the change
+      # files are still on dev, for the run that merge started, which builds on top of it.
+      - name: Push version changes
+        if: steps.rush-change.outputs.has-changes == 'true'
+        run: |
+          if ! git push --atomic --follow-tags origin dev; then
+            echo "::error::dev moved while this run built its release, so nothing was pushed or published. The run for the newer commit releases these changes too; if that commit did not start one, run this workflow again."
+            exit 1
+          fi
+
       # GitHub Packages before CodeArtifact, per package: a version a CodeArtifact has is always in
       # GitHub Packages, where stage and prod fetch it from.
       - name: Publish to GitHub Packages, then CodeArtifact
-        if: steps.rush-change.outputs.has-changes == 'true'
+        if: steps.release.outputs.publish == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -421,36 +478,10 @@ jobs:
             fi
           done
 
-      # Not [skip ci]: see the note above the job.
-      - name: Commit version changes
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          git add .
-          git commit -m "chore: publish packages"
-
-      - name: Create git tags from CHANGELOGs
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          # Find CHANGELOG.json files that were modified by rush version
-          git diff HEAD~1 --name-only | grep "CHANGELOG.json$" | while read changelog; do
-            if [ -f "$changelog" ]; then
-              tag=$(jq -r '.entries[0].tag // empty' "$changelog")
-              if [ -n "$tag" ]; then
-                echo "Creating tag: $tag"
-                git tag -a "$tag" -m "$tag"
-              fi
-            fi
-          done
-
-      - name: Push version changes
-        if: steps.rush-change.outputs.has-changes == 'true'
-        run: |
-          git push origin dev --follow-tags
-
       # One per tag the version commit created, with its tarball. prod's promotion makes them full
       # releases.
       - name: Create GitHub pre-releases with artifacts
-        if: steps.rush-change.outputs.has-changes == 'true'
+        if: steps.release.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -470,7 +501,7 @@ jobs:
           done
 
       - name: Create release notes
-        if: steps.rush-change.outputs.has-changes == 'true'
+        if: steps.release.outputs.publish == 'true'
         uses: actions/github-script@v7
         with:
           script: |
