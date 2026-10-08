@@ -22,7 +22,8 @@
 #                 earlier one dev released that the CodeArtifact lacks. prod alone turns the GitHub
 #                 releases into full releases.
 #
-# The caller triggers on pushes to dev, stage and prod; on any other branch this does nothing.
+# The caller triggers on every push to dev, stage and prod, with no `paths` filter (see `plan`); on
+# any other branch this does nothing.
 #
 #   uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
 #   with:
@@ -104,7 +105,51 @@ env:
   AWS_REGION: ${{ inputs.aws-region }}
 
 jobs:
-  # `release` versions, packs and publishes, on dev only:
+  # `plan` decides in seconds whether dev has anything to release, so a push that has nothing waits
+  # for no install and no build. It is the dev half of what a caller's `paths` filter used to do, and
+  # the reason callers have none: GitHub matches `paths` against the first 300 changed files only,
+  # and a promotion's diff has no change file (the version commit deletes them), so a filter could
+  # keep a push to stage or prod from promoting anything. It decides as `release` does after
+  # building, and `release` decides again on the dev it builds: force, change files, or dev on a
+  # version commit (a re-run of a release whose publishing failed).
+  plan:
+    name: Plan on dev
+    if: >-
+      github.ref_name == 'dev'
+      && !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: publish packages'))
+    runs-on: ubuntu-latest
+
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+
+    steps:
+      # dev as it is now, as `release` checks it out, and only the change files.
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          sparse-checkout: common/changes
+
+      - name: Anything to release?
+        id: plan
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            echo "Force mode: releasing."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif [ -d common/changes ] && [ "$(ls -A common/changes)" ]; then
+            echo "Change files on dev: releasing."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif git log -1 --format=%s | grep -q '^chore: publish packages'; then
+            echo "dev is a version commit: publishing the versions it carries."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing to release: no change files on dev, and dev is not on a version commit."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # `release` versions, packs and publishes, on dev only, when `plan` found something:
   #   - GitHub Packages first, dist-tag `dev`. Every later promotion copies a version from there,
   #     so a version reaches a CodeArtifact only once GitHub Packages has it.
   #   - Then dev's CodeArtifact, dist-tag `latest`. Each environment's registry is its own, and its
@@ -112,15 +157,14 @@ jobs:
   #     version got is GitHub Packages' dist-tags: `dev`, then `stage`, then `latest`.
   #   - The GitHub releases are pre-releases until prod promotes them.
   #   - The version commit is not marked [skip ci]. GitHub skips a push whose head commit says so,
-  #     and stage and prod promote by fast-forwarding to that commit. This job skips the run that
-  #     commit starts on dev, by its message.
+  #     and stage and prod promote by fast-forwarding to that commit. `plan` skips the run that
+  #     commit starts on dev, by its message, and this job with it.
   #   - The version commit and its tags are pushed before either registry sees a version, so a
   #     version is only ever published from a commit that is on dev.
   release:
     name: Release on dev
-    if: >-
-      github.ref_name == 'dev'
-      && !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: publish packages'))
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
 
     environment: dev

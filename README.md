@@ -45,8 +45,7 @@ jobs:
 # .github/workflows/publish.yml — dev releases, stage and prod promote
 on:
   push:
-    branches: [dev, stage, prod]
-    paths: ['packages/**', 'common/changes/**']
+    branches: [dev, stage, prod] # no `paths`: see "No paths filter" below
 jobs:
   publish:
     uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
@@ -103,6 +102,13 @@ and stage and prod publish those same bytes — never a build of their own:
 - **Every version gets a changelog entry, a tag and a release.** Rush writes no
   changelog for a prerelease (`0.1.0-next.N`), so the workflow writes the entry
   from the change files and deletes them, as Rush does for a final version.
+- **No `paths` filter.** A caller triggers on every push to the three branches. GitHub
+  matches `paths` against the first 300 changed files only, and a promotion's diff
+  has no change file (the version commit deletes them), so a filter could keep a
+  push to stage or prod from promoting anything. On dev, the `plan` job does the
+  filter's work instead: it checks out only `common/changes` and decides in seconds
+  whether there is anything to release (force, change files, or dev on a version
+  commit), so a push with nothing to release never installs or builds.
 - **Other branches.** The workflow does nothing on any branch but these three.
 - **`promote`** is how a caller opted in while the older per-environment pipeline
   still existed. It is ignored now; drop it when you next touch the caller.
