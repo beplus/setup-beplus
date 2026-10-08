@@ -84,6 +84,10 @@ and stage and prod publish those same bytes — never a build of their own:
   A version the registry refuses (one archived there on purpose) is a warning, not
   a failed run, and the next promotion tries it again. prod makes each one's GitHub
   release a full release; none of them takes "Latest" from the newest.
+- **"Latest" on GitHub** is one release: the version prod promoted of the package
+  `latest-release` names, else of the repository's only package, else of the one named
+  after the repository (`@beplus/cdk` in beplus/cdk). With none of them, prod leaves the
+  badge alone. It is set on every prod promotion, so it always matches prod's `latest`.
 - **Dist-tags.** Each CodeArtifact is its environment's own registry, so a promoted
   version becomes its `latest`: what an install in that environment gets. The
   earlier versions go out first, under a temporary `catch-up` tag, so `latest` never

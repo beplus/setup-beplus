@@ -81,6 +81,14 @@ on:
         required: false
         type: string
         default: ""
+      latest-release:
+        description: >-
+          The package whose GitHub release prod marks "Latest", e.g. "@beplus/cli-plugin-ai". Left
+          empty, it is the repository's only package, else the one named after the repository; with
+          neither, prod leaves the badge where it is.
+        required: false
+        type: string
+        default: ""
       aws-region:
         description: "AWS region for the OIDC role."
         required: false
@@ -824,8 +832,8 @@ jobs:
 
       # Every version prod now has of those dev released up to this commit, so a release an earlier
       # promotion left a pre-release becomes a full release too. One listing finds the pre-releases.
-      # An earlier version's release never takes "Latest"; GitHub picks it among this commit's, as
-      # before.
+      # Making one full never moves "Latest": GitHub does not move it on that edit anyway, and a
+      # repository of several packages has one badge for all of them.
       - name: Make the GitHub releases full releases
         if: github.ref_name == 'prod'
         env:
@@ -837,11 +845,45 @@ jobs:
             exit 0
           fi
           # Rush tags a release <name>_v<version>.
-          while read -r spec tag; do
+          while read -r spec _; do
             release="${spec%@*}_v${spec##*@}"
             grep -qxF "$release" <<< "$prereleases" || continue
-            latest=()
-            [ "$tag" = latest ] || latest=(--latest=false)
-            gh release edit "$release" --repo "$GITHUB_REPOSITORY" --prerelease=false "${latest[@]}" \
+            gh release edit "$release" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest=false \
               || echo "::warning::Could not make ${release} a full release."
           done < "${RUNNER_TEMP}/landed.txt"
+
+      # "Latest" is one package's release at this commit, so the badge always shows what prod's
+      # `latest` is: `latest-release`'s, else the only package's, else the one named after the
+      # repository. With none of them it stays where it is. Set on every promotion, so it also moves
+      # a badge an earlier one left behind.
+      - name: Mark the Latest GitHub release
+        if: github.ref_name == 'prod'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST_RELEASE: ${{ inputs.latest-release }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: |
+          promoted="${RUNNER_TEMP}/promote.txt"
+          if [ -n "$LATEST_RELEASE" ]; then
+            name=$LATEST_RELEASE
+          elif [ "$(wc -l < "$promoted")" -eq 1 ]; then
+            name=$(sed 's/@[^@]*$//' "$promoted")
+          else
+            name=$(sed 's/@[^@]*$//' "$promoted" | awk -F/ -v repository="$REPOSITORY_NAME" '$NF == repository' | head -n 1)
+          fi
+          if [ -z "$name" ]; then
+            echo "This repository publishes several packages, none named ${REPOSITORY_NAME}, and latest-release is not set: the Latest release stays where it is."
+            exit 0
+          fi
+          spec=$(awk -v prefix="${name}@" 'index($0, prefix) == 1' "$promoted")
+          if [ -z "$spec" ]; then
+            echo "::warning::latest-release is ${name}, which this repository does not publish, so no release was marked Latest."
+            exit 0
+          fi
+          # Rush tags a release <name>_v<version>.
+          release="${name}_v${spec##*@}"
+          if gh release edit "$release" --repo "$GITHUB_REPOSITORY" --latest > /dev/null; then
+            echo "Marked ${release} Latest."
+          else
+            echo "::warning::Could not mark ${release} Latest. Is there a GitHub release for it?"
+          fi
