@@ -76,10 +76,20 @@ and stage and prod publish those same bytes — never a build of their own:
 
 - **stage and prod promote the versions their commit carries.** Fast-forward them to
   a commit dev released. A version GitHub Packages does not have is refused.
+- **And every version before it.** A fast-forward promotes the commits in between
+  too, so each promotion also publishes every earlier version dev released that
+  the environment's CodeArtifact lacks: release on dev as often as you like and
+  promote when you are ready, and stage and prod still end up with every version,
+  so a lockfile that pinned one on dev installs there too. "Earlier" is semver, up
+  to the commit's own version; dev's newer releases wait for their own promotion.
+  A version the registry refuses (one archived there on purpose) is a warning, not
+  a failed run, and the next promotion tries it again. prod makes each one's GitHub
+  release a full release; none of them takes "Latest" from the newest.
 - **Dist-tags.** Each CodeArtifact is its environment's own registry, so a promoted
-  version becomes its `latest`: what an install in that environment gets. GitHub
-  Packages is the one registry every environment shares, so its tags show how far a
-  version got.
+  version becomes its `latest`: what an install in that environment gets. The
+  earlier versions go out first, under a temporary `catch-up` tag, so `latest` never
+  moves back. GitHub Packages is the one registry every environment shares, so its
+  tags show how far a version got.
 - **No `[skip ci]` on the version commit.** GitHub skips a push whose head commit
   says `[skip ci]`, and stage and prod fast-forward to exactly that commit. The dev
   run skips the version commit by its message instead.
