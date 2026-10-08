@@ -88,8 +88,10 @@ and stage and prod publish those same bytes — never a build of their own:
 - **Dist-tags.** Each CodeArtifact is its environment's own registry, so a promoted
   version becomes its `latest`: what an install in that environment gets. The
   earlier versions go out first, under a temporary `catch-up` tag, so `latest` never
-  moves back. GitHub Packages is the one registry every environment shares, so its
-  tags show how far a version got.
+  moves back. Removing that tag needs `codeartifact:PutPackageMetadata` on the
+  `npm-publishing` role; a tag a run could not remove goes on the next one. GitHub
+  Packages is the one registry every environment shares, so its tags show how far a
+  version got.
 - **No `[skip ci]` on the version commit.** GitHub skips a push whose head commit
   says `[skip ci]`, and stage and prod fast-forward to exactly that commit. The dev
   run skips the version commit by its message instead.

@@ -559,8 +559,9 @@ jobs:
   #     last promotion: an app whose lockfile pinned one of those versions on dev must install here.
   #     "Earlier" is semver: dev releases one version at a time, so a lower version GitHub Packages
   #     has came from a commit before this one. These go out oldest first under a `catch-up` tag of
-  #     their own, so `latest` never moves back, and the tag is removed after. One the registry
-  #     refuses (archived there on purpose, say) is a warning, and the next promotion tries again.
+  #     their own, so `latest` never moves back, and the tag is removed after, from every package
+  #     that has one: one a run could not remove goes on the next. One the registry refuses
+  #     (archived there on purpose, say) is a warning, and the next promotion tries again.
   promote:
     name: Promote to ${{ github.ref_name }}
     if: github.ref_name == 'stage' || github.ref_name == 'prod'
@@ -631,7 +632,8 @@ jobs:
 
       # released.txt: every version dev released up to this commit, oldest first per package and this
       # commit's last, one `<name>@<version> <dist-tag> <here|missing>` a line, `here` when this
-      # CodeArtifact has it. Two registry calls a package: GitHub Packages', then CodeArtifact's.
+      # CodeArtifact has it. tagged.txt: the packages that still carry a `catch-up` tag here. Two
+      # registry calls a package: GitHub Packages', then CodeArtifact's.
       - name: Find what this CodeArtifact is missing
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -645,15 +647,16 @@ jobs:
           // npm's own copy, which every npm carries: nothing is installed here.
           const semver = require(path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'npm', 'node_modules', 'semver'));
 
-          // Every version of a package a registry has, none when it has none; anything else stops the run.
-          const versions = (name, ...args) => {
+          // Every version of a package a registry has, and its dist-tags; none when it has none.
+          // Anything else stops the run.
+          const view = (name, ...args) => {
             try {
-              const out = execFileSync('npm', ['view', name, 'versions', '--json', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-              const list = out.trim() ? JSON.parse(out) : [];
-              return Array.isArray(list) ? list : [list];
+              const out = execFileSync('npm', ['view', name, 'versions', 'dist-tags', '--json', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+              const info = out.trim() ? JSON.parse(out) : {};
+              return { versions: [].concat(info.versions ?? []), tags: info['dist-tags'] ?? {} };
             } catch (error) {
               const out = `${error.stdout ?? ''}${error.stderr ?? ''}`;
-              if (out.includes('E404')) return [];
+              if (out.includes('E404')) return { versions: [], tags: {} };
               console.log(`::error::Cannot list the versions of ${name}: ${out.trim() || error.message}`);
               process.exit(1);
             }
@@ -662,26 +665,31 @@ jobs:
           const temp = process.env.RUNNER_TEMP;
           const github = ['--userconfig', path.join(temp, '.npmrc-github')];
           const lines = [];
+          const tagged = [];
           let refused = false;
           for (const spec of fs.readFileSync(path.join(temp, 'promote.txt'), 'utf8').split('\n').filter(Boolean)) {
             const at = spec.lastIndexOf('@');
             const [name, version] = [spec.slice(0, at), spec.slice(at + 1)];
-            const released = versions(name, ...github);
+            const released = view(name, ...github).versions;
             if (!released.includes(version)) {
               console.log(`::error::${spec} is not in GitHub Packages, so dev never released it. Promote a commit dev released.`);
               refused = true;
               continue;
             }
-            const here = new Set(versions(name));
+            const { versions, tags } = view(name);
+            const here = new Set(versions);
             const state = (v) => (here.has(v) ? 'here' : 'missing');
+            if (tags['catch-up']) tagged.push(name);
             const earlier = semver.sort(released.filter((v) => semver.lt(v, version)));
             const missing = earlier.filter((v) => !here.has(v));
             for (const v of earlier) lines.push(`${name}@${v} catch-up ${state(v)}`);
             lines.push(`${spec} latest ${state(version)}`);
             console.log(`${spec}: ${here.has(version) ? 'already here' : 'to publish'}`
-              + (missing.length ? `, and ${missing.length} earlier to catch up on: ${missing.join(', ')}` : ''));
+              + (missing.length ? `, and ${missing.length} earlier to catch up on: ${missing.join(', ')}` : '')
+              + (tags['catch-up'] ? `; removing the catch-up tag an earlier run left on ${tags['catch-up']}` : ''));
           }
           fs.writeFileSync(path.join(temp, 'released.txt'), lines.map((line) => `${line}\n`).join(''));
+          fs.writeFileSync(path.join(temp, 'tagged.txt'), tagged.map((name) => `${name}\n`).join(''));
           process.exit(refused ? 1 : 0);
           EOF
           node "${RUNNER_TEMP}/released.cjs"
@@ -727,12 +735,13 @@ jobs:
             echo "$spec $tag" >> "${RUNNER_TEMP}/landed.txt"
           done < "${RUNNER_TEMP}/released.txt"
 
-          # The catch-up tag only kept `latest` where it was while the earlier versions went out.
-          if [ "${#caught_up[@]}" -gt 0 ]; then
-            printf '%s\n' "${caught_up[@]}" | sort -u | while read -r name; do
-              npm dist-tag rm "$name" catch-up > /dev/null || echo "::warning::Could not remove the catch-up tag from ${name}."
-            done
-          fi
+          # The catch-up tag only kept `latest` where it was while the earlier versions went out. It goes
+          # from every package that has one: those caught up now, and those an earlier run left it on.
+          { printf '%s\n' "${caught_up[@]}"; cat "${RUNNER_TEMP}/tagged.txt"; } | sed '/^$/d' | sort -u \
+            | while read -r name; do
+                npm dist-tag rm "$name" catch-up > /dev/null \
+                  || echo "::warning::Could not remove the catch-up tag from ${name}: the role needs codeartifact:PutPackageMetadata. The next promotion tries again."
+              done
 
           {
             echo "### Promoted to ${GITHUB_REF_NAME}"
