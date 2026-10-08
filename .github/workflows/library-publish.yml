@@ -18,8 +18,9 @@
 #   dev           versions and packs once, and publishes those tarballs to GitHub Packages
 #                 first, then to dev's CodeArtifact. Its GitHub releases are pre-releases.
 #   stage, prod   build nothing. Each publishes the tarballs dev published, fetched from GitHub
-#                 Packages, to its own CodeArtifact. prod alone turns the GitHub releases into full
-#                 releases.
+#                 Packages, to its own CodeArtifact: the versions its commit carries, and every
+#                 earlier one dev released that the CodeArtifact lacks. prod alone turns the GitHub
+#                 releases into full releases.
 #
 # The caller triggers on pushes to dev, stage and prod; on any other branch this does nothing.
 #
@@ -549,10 +550,17 @@ jobs:
               .addRaw(allReleaseNotes)
               .write();
 
-  # stage and prod build nothing. Every package Rush publishes here is promoted at the version this
-  # commit carries: fetched from GitHub Packages, where dev published it, and published byte for
-  # byte to this environment's CodeArtifact. A version GitHub Packages does not have is one dev never
-  # released, and is refused.
+  # stage and prod build nothing. Every version they publish is fetched from GitHub Packages, where
+  # dev published it, and published byte for byte to this environment's CodeArtifact:
+  #   - Every package Rush publishes here, at the version this commit carries. It becomes `latest`.
+  #     A version GitHub Packages does not have is one dev never released, and is refused.
+  #   - Every earlier version of it dev released that this CodeArtifact lacks. A fast-forward
+  #     promotes the commits before this one too, and dev may have released several times since the
+  #     last promotion: an app whose lockfile pinned one of those versions on dev must install here.
+  #     "Earlier" is semver: dev releases one version at a time, so a lower version GitHub Packages
+  #     has came from a commit before this one. These go out oldest first under a `catch-up` tag of
+  #     their own, so `latest` never moves back, and the tag is removed after. One the registry
+  #     refuses (archived there on purpose, say) is a warning, and the next promotion tries again.
   promote:
     name: Promote to ${{ github.ref_name }}
     if: github.ref_name == 'stage' || github.ref_name == 'prod'
@@ -607,32 +615,6 @@ jobs:
           cat "${RUNNER_TEMP}/promote.txt"
           [ -s "${RUNNER_TEMP}/promote.txt" ] || { echo "::error::rush.json lists no package to publish."; exit 1; }
 
-      - name: Fetch them from GitHub Packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # The token stays in the environment: npm expands ${NODE_AUTH_TOKEN} itself.
-          npmrc="${RUNNER_TEMP}/.npmrc-github"
-          printf '%s\n' '@beplus:registry=https://npm.pkg.github.com' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "${npmrc}"
-
-          # Exit 0 when name@version is in the registry, 1 when it is not; anything else stops the run.
-          published() {
-            local out
-            if out=$(npm view "$1" version "${@:2}" 2>&1); then [ -n "$out" ]; return; fi
-            echo "$out" | grep -q E404 && return 1
-            echo "::error::Cannot tell whether $1 is published: $out"; exit 1
-          }
-          mkdir -p npm
-          while IFS= read -r spec; do
-            if ! published "$spec" --userconfig "${npmrc}"; then
-              echo "::error::${spec} is not in GitHub Packages, so dev never released it. Promote a commit dev released."
-              exit 1
-            fi
-            npm pack "$spec" --pack-destination npm --userconfig "${npmrc}" > /dev/null
-          done < "${RUNNER_TEMP}/promote.txt"
-          ls -l npm
-
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-beplus-${{ github.event.repository.name }}-${{ github.ref_name }}-npm-publishing
@@ -647,23 +629,121 @@ jobs:
       - name: Authenticate with AWS CodeArtifact
         run: beplus aws codeartifact auth --env "${BE_ENVIRONMENT}"
 
-      - name: Publish to CodeArtifact
+      # released.txt: every version dev released up to this commit, oldest first per package and this
+      # commit's last, one `<name>@<version> <dist-tag> <here|missing>` a line, `here` when this
+      # CodeArtifact has it. Two registry calls a package: GitHub Packages', then CodeArtifact's.
+      - name: Find what this CodeArtifact is missing
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The token stays in the environment: npm expands ${NODE_AUTH_TOKEN} itself.
+          printf '%s\n' '@beplus:registry=https://npm.pkg.github.com' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "${RUNNER_TEMP}/.npmrc-github"
+          cat > "${RUNNER_TEMP}/released.cjs" <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const { execFileSync } = require('child_process');
+          // npm's own copy, which every npm carries: nothing is installed here.
+          const semver = require(path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'npm', 'node_modules', 'semver'));
+
+          // Every version of a package a registry has, none when it has none; anything else stops the run.
+          const versions = (name, ...args) => {
+            try {
+              const out = execFileSync('npm', ['view', name, 'versions', '--json', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+              const list = out.trim() ? JSON.parse(out) : [];
+              return Array.isArray(list) ? list : [list];
+            } catch (error) {
+              const out = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+              if (out.includes('E404')) return [];
+              console.log(`::error::Cannot list the versions of ${name}: ${out.trim() || error.message}`);
+              process.exit(1);
+            }
+          };
+
+          const temp = process.env.RUNNER_TEMP;
+          const github = ['--userconfig', path.join(temp, '.npmrc-github')];
+          const lines = [];
+          let refused = false;
+          for (const spec of fs.readFileSync(path.join(temp, 'promote.txt'), 'utf8').split('\n').filter(Boolean)) {
+            const at = spec.lastIndexOf('@');
+            const [name, version] = [spec.slice(0, at), spec.slice(at + 1)];
+            const released = versions(name, ...github);
+            if (!released.includes(version)) {
+              console.log(`::error::${spec} is not in GitHub Packages, so dev never released it. Promote a commit dev released.`);
+              refused = true;
+              continue;
+            }
+            const here = new Set(versions(name));
+            const state = (v) => (here.has(v) ? 'here' : 'missing');
+            const earlier = semver.sort(released.filter((v) => semver.lt(v, version)));
+            const missing = earlier.filter((v) => !here.has(v));
+            for (const v of earlier) lines.push(`${name}@${v} catch-up ${state(v)}`);
+            lines.push(`${spec} latest ${state(version)}`);
+            console.log(`${spec}: ${here.has(version) ? 'already here' : 'to publish'}`
+              + (missing.length ? `, and ${missing.length} earlier to catch up on: ${missing.join(', ')}` : ''));
+          }
+          fs.writeFileSync(path.join(temp, 'released.txt'), lines.map((line) => `${line}\n`).join(''));
+          process.exit(refused ? 1 : 0);
+          EOF
+          node "${RUNNER_TEMP}/released.cjs"
+
+      # Each missing version is fetched from GitHub Packages and published as it is, in released.txt's
+      # order, so a package's `latest` is the last of its versions to land. Only this commit's version
+      # failing fails the run; it goes on to the next package first, so one failure hides no other.
+      # landed.txt: every version in released.txt this CodeArtifact has now.
+      - name: Publish them to CodeArtifact
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Exit 0 when name@version is in the registry, 1 when it is not; anything else stops the run.
-          published() {
-            local out
-            if out=$(npm view "$1" version "${@:2}" 2>&1); then [ -n "$out" ]; return; fi
-            echo "$out" | grep -q E404 && return 1
-            echo "::error::Cannot tell whether $1 is published: $out"; exit 1
+          mkdir -p npm
+          : > "${RUNNER_TEMP}/landed.txt"
+          promote() {
+            local file
+            file=$(npm pack "$1" --pack-destination npm --userconfig "${RUNNER_TEMP}/.npmrc-github" | tail -n 1) || return 1
+            # `./`: to npm, a bare `npm/<file>.tgz` is a GitHub `owner/repo` shorthand.
+            npm publish "./npm/${file}" --tag "$2"
           }
-          # `./`: to npm, a bare `npm/<file>.tgz` is a GitHub `owner/repo` shorthand.
-          for file in ./npm/*.tgz; do
-            spec=$(tar -xOzf "$file" package/package.json | jq -r '"\(.name)@\(.version)"')
-            if published "$spec"; then echo "Skipping $spec: already in CodeArtifact"; continue; fi
-            echo "Publishing $spec (dist-tag latest)"
-            npm publish "$file" --tag latest
-          done
+          published=() caught_up=() failed=() refused=""
+          while read -r spec tag state; do
+            if [ "$state" = missing ]; then
+              echo "Publishing $spec (dist-tag $tag)"
+              if ! promote "$spec" "$tag"; then
+                failed+=("$spec")
+                if [ "$tag" = latest ]; then
+                  echo "::error::Could not publish ${spec}, the version this commit carries."
+                  refused=1
+                else
+                  echo "::warning::Could not publish ${spec}. The next promotion tries again."
+                fi
+                continue
+              fi
+              if [ "$tag" = latest ]; then
+                published+=("- \`${spec}\`, now \`latest\`")
+              else
+                published+=("- \`${spec}\`, caught up")
+                caught_up+=("${spec%@*}")
+              fi
+            fi
+            echo "$spec $tag" >> "${RUNNER_TEMP}/landed.txt"
+          done < "${RUNNER_TEMP}/released.txt"
+
+          # The catch-up tag only kept `latest` where it was while the earlier versions went out.
+          if [ "${#caught_up[@]}" -gt 0 ]; then
+            printf '%s\n' "${caught_up[@]}" | sort -u | while read -r name; do
+              npm dist-tag rm "$name" catch-up > /dev/null || echo "::warning::Could not remove the catch-up tag from ${name}."
+            done
+          fi
+
+          {
+            echo "### Promoted to ${GITHUB_REF_NAME}"
+            echo
+            if [ "${#published[@]}" -eq 0 ] && [ "${#failed[@]}" -eq 0 ]; then
+              echo "This CodeArtifact already had every version dev released up to this commit."
+            fi
+            if [ "${#published[@]}" -gt 0 ]; then printf '%s\n' "${published[@]}"; fi
+            for spec in "${failed[@]}"; do echo "- \`${spec}\`, not published: see the annotations"; done
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ -n "$refused" ]; then exit 1; fi
 
       # How far a version got, in the one registry every environment shares: `stage`, and prod's
       # `latest`. A registry that refuses a tag warns rather than stopping a promotion.
@@ -678,16 +758,26 @@ jobs:
               || echo "::warning::GitHub Packages did not tag ${spec} ${DIST_TAG}."
           done < "${RUNNER_TEMP}/promote.txt"
 
+      # Every version prod now has of those dev released up to this commit, so a release an earlier
+      # promotion left a pre-release becomes a full release too. One listing finds the pre-releases.
+      # An earlier version's release never takes "Latest"; GitHub picks it among this commit's, as
+      # before.
       - name: Make the GitHub releases full releases
         if: github.ref_name == 'prod'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if ! prereleases=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1000 \
+            --json tagName,isPrerelease --jq '.[] | select(.isPrerelease) | .tagName'); then
+            echo "::warning::Could not list the GitHub releases, so none was made a full release."
+            exit 0
+          fi
           # Rush tags a release <name>_v<version>.
-          while IFS= read -r spec; do
-            tag="${spec%@*}_v${spec##*@}"
-            if [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease 2>/dev/null)" = "true" ]; then
-              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --prerelease=false \
-                || echo "::warning::Could not make ${tag} a full release."
-            fi
-          done < "${RUNNER_TEMP}/promote.txt"
+          while read -r spec tag; do
+            release="${spec%@*}_v${spec##*@}"
+            grep -qxF "$release" <<< "$prereleases" || continue
+            latest=()
+            [ "$tag" = latest ] || latest=(--latest=false)
+            gh release edit "$release" --repo "$GITHUB_REPOSITORY" --prerelease=false "${latest[@]}" \
+              || echo "::warning::Could not make ${release} a full release."
+          done < "${RUNNER_TEMP}/landed.txt"
