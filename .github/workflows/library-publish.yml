@@ -632,8 +632,8 @@ jobs:
 
       # released.txt: every version dev released up to this commit, oldest first per package and this
       # commit's last, one `<name>@<version> <dist-tag> <here|missing>` a line, `here` when this
-      # CodeArtifact has it. tagged.txt: the packages that still carry a `catch-up` tag here. Two
-      # registry calls a package: GitHub Packages', then CodeArtifact's.
+      # CodeArtifact has it. tagged.txt: the packages that still carry a `catch-up` tag here. As a
+      # rule two registry calls a package: GitHub Packages', then CodeArtifact's.
       - name: Find what this CodeArtifact is missing
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -648,18 +648,27 @@ jobs:
           const semver = require(path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'npm', 'node_modules', 'semver'));
 
           // Every version of a package a registry has, and its dist-tags; none when it has none.
-          // Anything else stops the run.
-          const view = (name, ...args) => {
-            try {
-              const out = execFileSync('npm', ['view', name, 'versions', 'dist-tags', '--json', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-              const info = out.trim() ? JSON.parse(out) : {};
-              return { versions: [].concat(info.versions ?? []), tags: info['dist-tags'] ?? {} };
-            } catch (error) {
-              const out = `${error.stdout ?? ''}${error.stderr ?? ''}`;
-              if (out.includes('E404')) return { versions: [], tags: {} };
-              console.log(`::error::Cannot list the versions of ${name}: ${out.trim() || error.message}`);
-              process.exit(1);
+          // `npm view` answers only for a version its spec matches, `latest` when it names none, and
+          // prints nothing for a package without `latest`: dev publishes with `--tag dev`, so one dev
+          // first published that way has none in GitHub Packages. So each spec in turn names a version
+          // the registry may have ('' for `latest`), and the first that matches answers for the whole
+          // package. Anything else stops the run.
+          const view = (name, specs, ...args) => {
+            for (const spec of specs) {
+              try {
+                const out = execFileSync('npm', ['view', spec ? `${name}@${spec}` : name, 'versions', 'dist-tags', '--json', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+                if (!out.trim()) continue;
+                const info = JSON.parse(out);
+                return { versions: [].concat(info.versions ?? []), tags: info['dist-tags'] ?? {} };
+              } catch (error) {
+                const out = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+                if (out.includes('No match found for version')) continue;
+                if (out.includes('E404')) return { versions: [], tags: {} };
+                console.log(`::error::Cannot list the versions of ${name}: ${out.trim() || error.message}`);
+                process.exit(1);
+              }
             }
+            return { versions: [], tags: {} };
           };
 
           const temp = process.env.RUNNER_TEMP;
@@ -670,17 +679,19 @@ jobs:
           for (const spec of fs.readFileSync(path.join(temp, 'promote.txt'), 'utf8').split('\n').filter(Boolean)) {
             const at = spec.lastIndexOf('@');
             const [name, version] = [spec.slice(0, at), spec.slice(at + 1)];
-            const released = view(name, ...github).versions;
+            // The version this commit carries: GitHub Packages has it, or dev never released it.
+            const released = view(name, [version], ...github).versions;
             if (!released.includes(version)) {
               console.log(`::error::${spec} is not in GitHub Packages, so dev never released it. Promote a commit dev released.`);
               refused = true;
               continue;
             }
-            const { versions, tags } = view(name);
+            const earlier = semver.sort(released.filter((v) => semver.lt(v, version)));
+            // `latest`, else any version dev released up to here, newest first.
+            const { versions, tags } = view(name, ['', version, ...[...earlier].reverse()]);
             const here = new Set(versions);
             const state = (v) => (here.has(v) ? 'here' : 'missing');
             if (tags['catch-up']) tagged.push(name);
-            const earlier = semver.sort(released.filter((v) => semver.lt(v, version)));
             const missing = earlier.filter((v) => !here.has(v));
             for (const v of earlier) lines.push(`${name}@${v} catch-up ${state(v)}`);
             lines.push(`${spec} latest ${state(version)}`);
