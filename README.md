@@ -70,7 +70,7 @@ and stage and prod publish those same bytes — never a build of their own:
 
 | Branch | The run | Its CodeArtifact | GitHub Packages | GitHub releases |
 |---|---|---|---|---|
-| `dev` | versions and packs once; GitHub Packages first, then dev's CodeArtifact; commits, tags, pushes | `latest` | `dev` | pre-releases |
+| `dev` | versions and packs once; commits, tags, pushes; then GitHub Packages first, then dev's CodeArtifact | `latest` | `dev` | pre-releases |
 | `stage` | builds nothing: publishes the tarballs dev published, fetched from GitHub Packages | `latest` | `stage` | — |
 | `prod` | the same, for prod | `latest` | `latest` | full releases |
 
@@ -83,6 +83,11 @@ and stage and prod publish those same bytes — never a build of their own:
 - **No `[skip ci]` on the version commit.** GitHub skips a push whose head commit
   says `[skip ci]`, and stage and prod fast-forward to exactly that commit. The dev
   run skips the version commit by its message instead.
+- **Pushed before published.** A dev run releases dev as it is when the run starts,
+  and pushes its version commit and tags, atomically, before either registry sees a
+  version. If something is merged to dev while it builds, the push is rejected and
+  nothing is published; the run that merge started (queued behind this one) releases
+  both.
 - **Every version gets a changelog entry, a tag and a release.** Rush writes no
   changelog for a prerelease (`0.1.0-next.N`), so the workflow writes the entry
   from the change files and deletes them, as Rush does for a final version.
