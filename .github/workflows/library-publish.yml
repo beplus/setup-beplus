@@ -462,6 +462,25 @@ jobs:
             --publish \
             --release-folder "$PACKAGES_DIR"
 
+      # No tarball carries a sourcemap: a .js.map embeds the original source in its sourcesContent.
+      # A package leaves them out with "!**/*.map" in its `files` (or *.map in its .npmignore).
+      # Checked before the version commit, so a failure here has pushed and published nothing.
+      # stage and prod publish dev's tarballs as they are, so this one check covers them too.
+      - name: Check the tarballs carry no sourcemaps
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          failed=0
+          for file in "$BE_PACKAGES_DIR"/*.tgz; do
+            [ -f "$file" ] || continue
+            maps=$(tar -tzf "$file" | grep -E '\.map$' || true)
+            if [ -n "$maps" ]; then
+              echo "::error::$(basename "$file") ships sourcemaps; add \"!**/*.map\" to its package.json files (or *.map to its .npmignore):"
+              echo "$maps"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
       # Not [skip ci]: see the note above the job.
       - name: Commit version changes
         if: steps.rush-change.outputs.has-changes == 'true'
