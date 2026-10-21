@@ -1,0 +1,247 @@
+# A beplus docs site's release bundle, attached to the repository's GitHub release.
+# ---------------------------------------------------------------------------------
+# beplus sites are private GitHub Pages, which only a signed-in person can open. What an agent reads
+# of a site — `docs-bundle.tgz`, `beplus-docs/release-bundle@1` (beplus/docs,
+# packages/sites/portal/docs/reference/release-bundle.md) — therefore goes onto the repository's
+# GitHub release too, where bepluscloud's `beplus-knowledge` App (Contents: read) and the local
+# `beplus kb` read it as a knowledge Area.
+#
+# A caller is one more job in the repository's publish workflow, after the release is made:
+#
+#   jobs:
+#     publish:
+#       uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
+#       # … as it is
+#     docs-bundle:
+#       needs: publish
+#       if: github.ref_name == 'dev'
+#       uses: beplus/setup-beplus/.github/workflows/docs-bundle.yml@v2
+#       permissions:
+#         contents: write
+#         pages: read
+#       secrets: inherit
+#       with:
+#         working-directory: packages/sites/portal
+#         package: packages/core/cli
+#         prebuild: node common/scripts/install-run-rush.js build --to @beplus/cli
+#
+# Why after `publish`, and not `on: release`: library-publish makes its releases with GITHUB_TOKEN,
+# and an event GITHUB_TOKEN causes starts no workflow. The releases are made on dev and promoted by
+# stage and prod, which keep their assets, so the bundle is attached once, on dev.
+#
+# The release is found, not passed: the tag of `package`'s newest CHANGELOG.json entry on the
+# branch (what library-publish just tagged and released). The site is built from that tag, so the
+# bundle is the release's even when dev has moved on. A release that already carries a bundle is
+# left alone — a push that released nothing does nothing — unless `overwrite` says otherwise; and
+# `gh release upload --clobber` makes a re-run safe either way.
+#
+# An earlier release gets its bundle from a run with `tag` set, e.g. "@beplus/cli_v2.11.0" — built
+# from that tag, so only a tag whose portal already has `pack` can be backfilled.
+#
+# Needs @beplus/docs-site >= 1.0.0-next.19, the first with `beplus-docs pack` (beplus/docs#31).
+
+name: Docs bundle to the GitHub release
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "The package holding docs.config.ts, relative to the repository root."
+        required: true
+        type: string
+      package:
+        description: "The package directory whose GitHub release carries the bundle — the product the pages describe. Its CHANGELOG.json names the release's tag. Not read when `tag` is set."
+        required: false
+        type: string
+        default: ""
+      tag:
+        description: "The release to attach the bundle to, e.g. \"@beplus/cli_v2.11.0\". Empty: the tag of `package`'s newest CHANGELOG.json entry on the branch this run is on."
+        required: false
+        type: string
+        default: ""
+      overwrite:
+        description: "Replace the bundle a release already carries. Off, such a release is left alone."
+        required: false
+        type: boolean
+        default: false
+      prebuild:
+        description: "A command run from the repository root after install and before the build — building what the site reads."
+        required: false
+        type: string
+        default: ""
+      build:
+        description: "The build command, run in the working directory."
+        required: false
+        type: string
+        default: "npm run build"
+      output:
+        description: "What the build writes, relative to the working directory."
+        required: false
+        type: string
+        default: "build/client"
+      environment:
+        description: "The environment the job runs in, when BE_NPM_TOKEN is an environment secret."
+        required: false
+        type: string
+        default: ""
+      node-version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "22.14"
+
+permissions:
+  contents: read
+
+# One upload per release at a time; never cancelled half-way. Keyed by `tag` as well, so a backfill
+# waiting behind a dev run is not replaced by the next one.
+concurrency:
+  group: docs-bundle-${{ github.repository }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    name: Attach the docs bundle to the release
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    # `contents: write` uploads the asset; `pages: read` asks Pages where the site is, so llms.txt
+    # links to the pages' real addresses.
+    permissions:
+      contents: write
+      pages: read
+
+    steps:
+      - name: Find the release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag }}
+          PACKAGE: ${{ inputs.package }}
+          OVERWRITE: ${{ inputs.overwrite }}
+        # Only "not there" skips: any other failure to ask (a token without contents: read) fails
+        # the run, rather than passing for a release with nothing to attach to.
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "::notice title=Docs bundle::$1"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            { echo "### Docs bundle"; echo; echo "Nothing attached: $1"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          if [ -z "$TAG" ]; then
+            if [ -z "$PACKAGE" ]; then
+              echo "::error title=Docs bundle::Set \`package\` (whose release carries the bundle) or \`tag\`."
+              exit 1
+            fi
+            PACKAGE="${PACKAGE%/}"
+            changelog="$PACKAGE/CHANGELOG.json"
+            if ! json=$(gh api "repos/$REPO/contents/$changelog?ref=$REF" -H 'Accept: application/vnd.github.raw' 2> "$RUNNER_TEMP/gh.err"); then
+              grep -q 'HTTP 404' "$RUNNER_TEMP/gh.err" || { cat "$RUNNER_TEMP/gh.err" >&2; exit 1; }
+              skip "$changelog is not on $REF, so $PACKAGE has no release to attach a bundle to."
+            fi
+            TAG=$(jq -r '.entries[0].tag // empty' <<< "$json")
+            [ -n "$TAG" ] || skip "$changelog has no entry yet, so $PACKAGE has no release to attach a bundle to."
+          fi
+          if ! assets=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2> "$RUNNER_TEMP/gh.err"); then
+            grep -q 'release not found' "$RUNNER_TEMP/gh.err" || { cat "$RUNNER_TEMP/gh.err" >&2; exit 1; }
+            skip "$TAG has no GitHub release, so there is nothing to attach a bundle to."
+          fi
+          if [ "$OVERWRITE" != "true" ] && grep -qx 'docs-bundle.tgz' <<< "$assets"; then
+            skip "$TAG already carries docs-bundle.tgz; run with overwrite to replace it."
+          fi
+          echo "Attaching the bundle to $TAG."
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      # The release's own commit, so the bundle describes what was released.
+      - uses: actions/checkout@v6
+        if: steps.release.outputs.skip != 'true'
+        with:
+          ref: refs/tags/${{ steps.release.outputs.tag }}
+
+      - name: Ask Pages where the site lives
+        id: pages
+        if: steps.release.outputs.skip != 'true'
+        # A site whose Pages cannot be asked packs links from the site's root instead.
+        continue-on-error: true
+        uses: actions/configure-pages@v5
+
+      - uses: actions/setup-node@v6
+        if: steps.release.outputs.skip != 'true'
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - uses: beplus/setup-beplus/cli@v2
+        if: steps.release.outputs.skip != 'true'
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
+          BE_NPM_AUTH: true
+
+      - name: Install dependencies
+        if: steps.release.outputs.skip != 'true'
+        run: node common/scripts/install-run-rush.js install
+
+      - name: Build what the site reads
+        if: steps.release.outputs.skip != 'true' && inputs.prebuild != ''
+        run: ${{ inputs.prebuild }}
+
+      - name: Build the site
+        if: steps.release.outputs.skip != 'true'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          DOCS_BASE: ${{ steps.pages.outputs.base_path }}
+          DOCS_SITE_URL: ${{ steps.pages.outputs.base_url }}
+        run: ${{ inputs.build }}
+
+      - name: Pack the bundle
+        if: steps.release.outputs.skip != 'true'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          OUTPUT: ${{ inputs.output }}
+        run: |
+          if ! npx --no-install beplus-docs pack --from "$OUTPUT" --out "$RUNNER_TEMP/docs-bundle.tgz"; then
+            echo "::error title=Docs bundle::beplus-docs pack failed. It needs @beplus/docs-site >= 1.0.0-next.19 in this portal, at this tag."
+            exit 1
+          fi
+
+      - name: Check the version the pages describe
+        if: steps.release.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          site=$(tar -xzOf "$RUNNER_TEMP/docs-bundle.tgz" bundle.json | jq -r '.site.version // empty')
+          released="${TAG##*_v}"
+          if [ "$site" != "$released" ]; then
+            echo "::warning title=Docs bundle::The site says version ${site:-(none)}, the release is $released. A reader trusts the site's: set site.version in docs.config.ts to the package's."
+          fi
+
+      - name: Attach it to the release
+        if: steps.release.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: gh release upload "$TAG" "$RUNNER_TEMP/docs-bundle.tgz" --repo "$REPO" --clobber
+
+      - name: Summarise
+        if: steps.release.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          index=$(tar -xzOf "$RUNNER_TEMP/docs-bundle.tgz" bundle.json)
+          {
+            echo "### Docs bundle"
+            echo
+            echo "- **Release**: $TAG"
+            echo "- **Site**: $(jq -r '.site.id' <<< "$index") $(jq -r '.site.version // "(no version)"' <<< "$index")"
+            echo "- **Pages**: $(jq '[.files[] | select(.route)] | length' <<< "$index")"
+            echo "- **Commit**: $(jq -r '.commit // "unknown"' <<< "$index")"
+            echo "- **sha256**: $(sha256sum "$RUNNER_TEMP/docs-bundle.tgz" | cut -d' ' -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
