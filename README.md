@@ -266,6 +266,51 @@ other repositories with the org's `beplus` App — `BE_GITHUB_APP_ID` (variable)
 and `BE_GITHUB_APP_PRIVATE_KEY` (secret), with Metadata, Pages and custom
 properties read. Without them the site shows the engine's own list.
 
+What an agent reads of that site goes onto the package's GitHub release too:
+`docs-bundle.yml` packs the build into `docs-bundle.tgz` (`beplus-docs pack`,
+the `beplus-docs/release-bundle@1` contract) and attaches it, where bepluscloud's
+`beplus-knowledge` App and the local `beplus kb` read it as a knowledge Area —
+the Pages site itself is private. It is one more job in the publish workflow,
+after `library-publish`:
+
+```yaml
+# .github/workflows/publish.yml
+jobs:
+  publish:
+    uses: beplus/setup-beplus/.github/workflows/library-publish.yml@v2
+    # … as it is
+  docs-bundle:
+    needs: publish
+    if: github.ref_name == 'dev'
+    uses: beplus/setup-beplus/.github/workflows/docs-bundle.yml@v2
+    permissions:
+      contents: write
+      pages: read
+    secrets: inherit
+    with:
+      working-directory: packages/sites/portal
+      package: packages/core/cli # the package whose release carries the bundle
+      prebuild: node common/scripts/install-run-rush.js build --to @beplus/cli
+```
+
+- **A job, not `on: release`.** library-publish creates its releases with
+  `GITHUB_TOKEN`, and an event that token causes starts no workflow.
+- **On dev only.** The releases are made there; stage and prod promote them, and
+  keep their assets.
+- **The release is found, not passed:** the tag of `package`'s newest
+  `CHANGELOG.json` entry on the branch. The site is built from that tag, so the
+  bundle is the release's even when dev has moved on.
+- **Once per release.** A release that has no GitHub release, or already carries
+  `docs-bundle.tgz`, is left alone (`overwrite: true` replaces it), so a push that
+  released nothing does nothing. It warns when the site's `site.version` is not
+  the released version.
+- **Backfill** an earlier release with `tag`, e.g. `tag: "@beplus/cli_v2.11.0"`
+  from a `workflow_dispatch` caller — built from that tag, so its portal must
+  already have `pack`.
+
+The other inputs are docs-pages.yml's: `build`, `output`, `environment` and
+`node-version`. It needs `@beplus/docs-site >= 1.0.0-next.19` (beplus/docs#31).
+
 ---
 
 ## Quick Start
