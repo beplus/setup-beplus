@@ -1,0 +1,394 @@
+# An application's pull-request checks — once.
+# --------------------------------------------
+# library-ci.yml is a library's gate: change files, version policies, bundle
+# sizes, a PR comment. An application in an estate (bepluscloud's console,
+# Mountaineer's, MRKIT's) needs something else: its own type check and tests,
+# and its integration suites against a real Postgres with every migration chain
+# applied. No estate ran those in CI. This is that job, written once; what
+# differs per repository is the project and the commands, and both are inputs:
+#
+#   jobs:
+#     console:
+#       uses: beplus/setup-beplus/.github/workflows/app-ci.yml@v2
+#       with:
+#         project: "@bepluscloud/console"
+#         github-environment: dev   # only where BE_NPM_TOKEN is an environment secret
+#         postgres: true
+#         setup: |
+#           npx react-router typegen
+#         checks: |
+#           npm run typecheck
+#           npx vitest run
+#       secrets: inherit
+#
+# What it does, in order:
+#   1. reads the project's folder from rush.json (and, with `postgres`, the test
+#      database's name from beplus.estate.json → naming.prefix + `_test`, as
+#      db-migrations-pr.yml does);
+#   2. Node, the beplus CLI the repository pins (beplus.estate.json → cli.version),
+#      `beplus npm auth`, and the stub-200 registry check over the project's
+#      @beplus dependencies (BE_NPM_CHECK);
+#   3. `rush install --to <project>`, then `rush build --to-except <project>`
+#      (`build: project` builds the project too, `none` builds nothing);
+#   4. with `postgres`: a pgvector Postgres service, pinned as db-migrations-pr.yml
+#      pins it; BE_POSTGRES_URL points at it, and `beplus db migrate` applies the
+#      repository's own migrator declaration — its chain and every embedded one
+#      (beplus_ai, beplus_kb, …) — exactly as a container does at start;
+#   5. `setup`, one command per line, in the project's folder; the first failure
+#      stops the job;
+#   6. `checks`, one command per line, in the project's folder. EVERY check runs,
+#      even after one has failed, so one failure does not hide another; the job
+#      fails if any did, each failure is an annotation on the run, and the job
+#      summary lists every check with its result and time.
+#
+# What stays in the repository is what is the repository's: when it runs, the
+# permissions it grants, the concurrency group, and the commands.
+#
+# It reaches NO database but the Postgres service it starts, reads no connection
+# secret and assumes no AWS role. The only secret it uses is BE_NPM_TOKEN, for
+# the private registry.
+
+name: App CI
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: >-
+          The Rush project the checks are for (e.g. @bepluscloud/console): what
+          `rush install --to` and `rush build --to-except` name. Its folder in
+          rush.json is where `setup` and `checks` run.
+        required: true
+        type: string
+      working-directory:
+        description: >-
+          Where `setup` and `checks` run, relative to the repository. Default: the
+          project's `projectFolder` in rush.json.
+        required: false
+        type: string
+        default: ""
+      build:
+        description: >-
+          What is built before the checks. `dependencies` (the default): every
+          workspace project the project depends on (`rush build --to-except`), so
+          its type check and tests see their built output. `project`: those and the
+          project itself (`rush build --to`). `none`: nothing.
+        required: false
+        type: string
+        default: dependencies
+      setup:
+        description: >-
+          Commands run once before the checks, one per line, in the working
+          directory (e.g. `npx react-router typegen`). The first that fails stops
+          the job. Blank lines and lines starting with `#` are skipped.
+        required: false
+        type: string
+        default: ""
+      checks:
+        description: >-
+          The checks, one command per line, each run with bash in the working
+          directory. Every check runs, even after one has failed; the job fails
+          if any did. Blank lines and lines starting with `#` are skipped.
+        required: true
+        type: string
+      postgres:
+        description: >-
+          Start a Postgres service (pgvector/pgvector:0.8.7-pg16), point
+          BE_POSTGRES_URL at it, and — with `migrate` — apply the repository's
+          migrations to it before `setup`.
+        required: false
+        type: boolean
+        default: false
+      migrate:
+        description: >-
+          With `postgres`: run `beplus db migrate` (the repository's migrator
+          declaration, beplus.estate.json → database, every chain) against the
+          service. Off: the database is left empty.
+        required: false
+        type: boolean
+        default: true
+      node-version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "22.14"
+      github-environment:
+        description: >-
+          The GitHub environment the job claims, when BE_NPM_TOKEN is an
+          environment secret there (bepluscloud, MRKIT: `dev`). Its branch policy
+          must then admit every branch the caller runs on. Empty (the default):
+          none — the token is a repository or organization secret.
+        required: false
+        type: string
+        default: ""
+      timeout-minutes:
+        description: "The checks job's timeout."
+        required: false
+        type: number
+        default: 40
+    secrets:
+      BE_NPM_TOKEN:
+        description: >-
+          npm.beplus.cloud token for the @beplus scope. `secrets: inherit` (or, for
+          an environment secret, `github-environment`) is all a caller passes.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # What a caller would otherwise write out, read from the files that already
+  # hold it. Every value comes from the pull request's own tree, so each is
+  # validated here before a later step uses it as a path or a name.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      directory: ${{ steps.project.outputs.directory }}
+      database: ${{ steps.project.outputs.database }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the project from rush.json
+        id: project
+        env:
+          INPUT_PROJECT: ${{ inputs.project }}
+          INPUT_DIRECTORY: ${{ inputs.working-directory }}
+          INPUT_BUILD: ${{ inputs.build }}
+          INPUT_POSTGRES: ${{ inputs.postgres }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$INPUT_PROJECT" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::the \`project\` input: \"$INPUT_PROJECT\" is not a Rush project name."
+            exit 1
+          fi
+          case "$INPUT_BUILD" in
+            dependencies | project | none) ;;
+            *)
+              echo "::error::the \`build\` input: \"$INPUT_BUILD\" is not one of dependencies, project, none."
+              exit 1
+              ;;
+          esac
+          if [ ! -f rush.json ]; then
+            echo "::error::No rush.json at the repository root: app-ci.yml runs a Rush monorepo's project."
+            exit 1
+          fi
+
+          # rush.json is JSONC: its comments go, strings stay as they are.
+          folder="$(node -e '
+            const src = require("fs").readFileSync("rush.json", "utf8");
+            let out = "";
+            for (let i = 0; i < src.length; ) {
+              const c = src[i], n = src[i + 1];
+              if (c === "\"") {
+                let j = i + 1;
+                while (j < src.length && src[j] !== "\"") j += src[j] === "\\" ? 2 : 1;
+                out += src.slice(i, j + 1); i = j + 1;
+              } else if (c === "/" && n === "/") {
+                while (i < src.length && src[i] !== "\n") i++;
+              } else if (c === "/" && n === "*") {
+                const end = src.indexOf("*/", i + 2); i = end < 0 ? src.length : end + 2;
+              } else { out += c; i++; }
+            }
+            const rush = JSON.parse(out.replace(/,(\s*[\]}])/g, "$1"));
+            const p = (rush.projects || []).find((p) => p.packageName === process.argv[1]);
+            process.stdout.write(p ? p.projectFolder : "");
+          ' "$INPUT_PROJECT")"
+          if [ -z "$folder" ]; then
+            echo "::error file=rush.json::rush.json has no project named \"$INPUT_PROJECT\"."
+            exit 1
+          fi
+
+          directory="${INPUT_DIRECTORY:-$folder}"
+          directory="${directory%/}"
+          if ! [[ "$directory" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] || [[ "/$directory/" == */../* ]]; then
+            echo "::error::the working directory \"$directory\" is not a relative directory in this repository."
+            exit 1
+          fi
+          if [ ! -d "$directory" ]; then
+            echo "::error::the working directory \"$directory\" does not exist."
+            exit 1
+          fi
+
+          database=""
+          if [ "$INPUT_POSTGRES" = true ]; then
+            # be_test, mrkit_test, mcl_test — the names db-migrations-pr.yml gives it.
+            prefix=""
+            if [ -f beplus.estate.json ]; then
+              prefix="$(jq -r '.naming.prefix // empty' beplus.estate.json)"
+            fi
+            database="$(printf '%s' "${prefix:-${GITHUB_REPOSITORY#*/}}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_' '_')_test"
+            if ! [[ "$database" =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; then
+              echo "::error file=beplus.estate.json::naming.prefix gives the test database \"$database\", which is not a Postgres identifier."
+              exit 1
+            fi
+          fi
+
+          echo "project $INPUT_PROJECT, checks in $directory${database:+, test database $database}"
+          {
+            echo "directory=$directory"
+            echo "database=$database"
+          } >> "$GITHUB_OUTPUT"
+
+  checks:
+    name: checks
+    needs: plan
+    runs-on: ubuntu-latest
+    # Where BE_NPM_TOKEN is an environment secret the job has to claim the
+    # environment to see it, and the environment's branch policy must then admit
+    # every branch the caller runs on. Empty: no environment.
+    environment: ${{ inputs.github-environment }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    # A service whose image is empty is not started, so without `postgres` there
+    # is none. pgvector, pinned: the beplus_ai chain runs CREATE EXTENSION vector,
+    # and the server the suites run on must not change under a pull request
+    # (db-migrations-pr.yml and @beplus/database/testing pin the same).
+    services:
+      postgres:
+        image: ${{ inputs.postgres && 'pgvector/pgvector:0.8.7-pg16' || '' }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ needs.plan.outputs.database }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # Keyed by the project too: `install --to` installs a subset, and
+      # db-migrations-pr.yml saves its own, smaller one under the plain key.
+      - name: Cache Rush and pnpm
+        uses: actions/cache@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ runner.os }}-${{ runner.arch }}-rush-${{ inputs.project }}-${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rush-${{ inputs.project }}-
+            ${{ runner.os }}-${{ runner.arch }}-rush-
+
+      # @beplus/* lives on npm.beplus.cloud; this writes the token into
+      # ~/.npmrc, and installs the beplus CLI the repository pins
+      # (beplus.estate.json → cli.version); `vars.BE_CLI_VERSION` still wins
+      # when it is set.
+      - name: Authenticate the @beplus scope
+        uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
+          BE_NPM_AUTH: true
+          # ⚠️ AND PROVE IT WORKED. npm.beplus.cloud answers a read it cannot
+          # authenticate with HTTP 200 and a stub body, never 401, so a token
+          # that did not reach this job fails nothing until pnpm, minutes later.
+          # This asks the registry for every @beplus package the project depends
+          # on, and fails here, naming the cause.
+          BE_NPM_CHECK: ${{ needs.plan.outputs.directory }}
+
+      - name: Rush install
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: node common/scripts/install-run-rush.js install --to "$PROJECT"
+
+      - name: Rush build
+        if: inputs.build != 'none'
+        env:
+          PROJECT: ${{ inputs.project }}
+          SELECTOR: ${{ inputs.build == 'project' && '--to' || '--to-except' }}
+        run: node common/scripts/install-run-rush.js build "$SELECTOR" "$PROJECT"
+
+      # Into the job's environment, so `setup` and every check see it; the
+      # integration suites read BE_POSTGRES_URL and skip without it.
+      - name: Point BE_POSTGRES_URL at the service
+        if: inputs.postgres
+        env:
+          DATABASE: ${{ needs.plan.outputs.database }}
+        run: echo "BE_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/$DATABASE" >> "$GITHUB_ENV"
+
+      # The repository's own migrator declaration (beplus.estate.json →
+      # database.migrator), run the way a container runs it: the product's chain,
+      # its hooks and every embedded chain, each under its lock. It reads
+      # BE_POSTGRES_URL from the environment — never from its command line.
+      - name: Migrate the service database
+        if: inputs.postgres && inputs.migrate
+        run: beplus db migrate
+
+      - name: Setup
+        if: inputs.setup != ''
+        working-directory: ${{ needs.plan.outputs.directory }}
+        env:
+          SETUP: ${{ inputs.setup }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r line || [ -n "$line" ]; do
+            command="${line#"${line%%[![:space:]]*}"}"
+            [ -n "$command" ] && [ "${command:0:1}" != "#" ] || continue
+            echo "::group::$command"
+            # stdin from /dev/null: a command must not read the rest of this list.
+            bash -eo pipefail -c "$command" < /dev/null
+            echo "::endgroup::"
+          done <<< "$SETUP"
+
+      - name: Checks
+        working-directory: ${{ needs.plan.outputs.directory }}
+        env:
+          CHECKS: ${{ inputs.checks }}
+          DIRECTORY: ${{ needs.plan.outputs.directory }}
+        run: |
+          # Not -e (GitHub's default for `run`): a failed check is counted, and the next one runs.
+          set +e -uo pipefail
+          ran=0
+          failed=0
+          rows=""
+          while IFS= read -r line || [ -n "$line" ]; do
+            command="${line#"${line%%[![:space:]]*}"}"
+            [ -n "$command" ] && [ "${command:0:1}" != "#" ] || continue
+            ran=$((ran + 1))
+            echo "::group::$command"
+            start=$SECONDS
+            # stdin from /dev/null: a check must not read the rest of this list.
+            bash -eo pipefail -c "$command" < /dev/null
+            rc=$?
+            took=$((SECONDS - start))
+            echo "::endgroup::"
+            cell="${command//|/\\|}"
+            if [ "$rc" -eq 0 ]; then
+              echo "✓ $command (${took}s)"
+              rows+="| ✅ | \`$cell\` | ${took}s |"$'\n'
+            else
+              failed=$((failed + 1))
+              echo "::error title=Check failed in $DIRECTORY::$command exited with $rc."
+              rows+="| ❌ | \`$cell\` | ${took}s (exit $rc) |"$'\n'
+            fi
+          done <<< "$CHECKS"
+
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::the \`checks\` input names no command."
+            exit 1
+          fi
+          {
+            echo "### Checks in \`$DIRECTORY\`"
+            echo
+            echo "| | Command | Time |"
+            echo "|---|---|---|"
+            printf '%s' "$rows"
+            echo
+            if [ "$failed" -eq 0 ]; then
+              echo "All $ran passed."
+            else
+              echo "$failed of $ran failed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$failed" -eq 0 ]

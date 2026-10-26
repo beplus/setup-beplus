@@ -237,6 +237,70 @@ caller plus these workflows reproduce the files it replaced: it runs the shared
 plan step on the estate's own manifest, compares every job and step, and runs the
 drift job's rewritten guard and comparison side by side with the copies'.
 
+An estate's application gets **`app-ci.yml`**: its own type check and tests on a
+pull request, and its integration suites against a real Postgres with every
+migration chain applied. `library-ci.yml` is a library's gate (change files,
+version policies, bundle sizes); no estate ran an app's tests in CI at all.
+
+- **plan** reads the project's folder from `rush.json` (the `projectFolder` of the
+  `project` input) and, with `postgres`, the test database's name the way
+  db-migrations-pr.yml does (`naming.prefix` + `_test`).
+- **checks** sets up Node, installs the pinned CLI, runs `beplus npm auth` with the
+  stub-200 registry check over the project's `@beplus` dependencies, then
+  `rush install --to <project>` and `rush build --to-except <project>`.
+- **With `postgres`** it starts `pgvector/pgvector:0.8.7-pg16`, points
+  `BE_POSTGRES_URL` at it, and runs `beplus db migrate`: the repository's own
+  migrator declaration, every embedded chain included, as a container migrates at
+  start.
+- Then `setup` runs, one command per line, stopping at the first failure. Then
+  **every** line of `checks` runs, in the project's folder, even after one has
+  failed. The job fails if any did; each failure is an annotation, and the job
+  summary lists every check with its result and time.
+
+```yaml
+# .github/workflows/console-ci.yml — keep your own triggers
+name: console CI
+on:
+  pull_request:
+    branches: [dev]
+permissions:
+  contents: read
+concurrency:
+  group: console-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  console:
+    uses: beplus/setup-beplus/.github/workflows/app-ci.yml@v2
+    with:
+      project: "@bepluscloud/console"
+      github-environment: dev   # only where BE_NPM_TOKEN is an environment secret
+      postgres: true
+      setup: |
+        npx react-router typegen
+      checks: |
+        npm run typecheck
+        npx vitest run --exclude "**/*.integration.test.ts"
+        npx vitest run .integration.test.ts
+    secrets: inherit
+```
+
+| Input | Default | |
+|---|---|---|
+| `project` | required | The Rush project; its folder is where `setup` and `checks` run |
+| `checks` | required | One command per line; every one runs |
+| `setup` | none | One command per line, before the checks; the first failure stops the job |
+| `postgres` | `false` | The pgvector service, `BE_POSTGRES_URL`, and (`migrate`) the migrations |
+| `migrate` | `true` | With `postgres`: `beplus db migrate` against the service |
+| `build` | `dependencies` | `dependencies` (`--to-except`), `project` (`--to`) or `none` |
+| `working-directory` | the project's folder | Where `setup` and `checks` run |
+| `github-environment` | none | The environment holding `BE_NPM_TOKEN` (bepluscloud, MRKIT: `dev`) |
+| `node-version` | `22.14` | |
+| `timeout-minutes` | `40` | The checks job's |
+
+The check is named `<caller job> / checks` (`console / checks`). It reaches no
+database but its own service, reads no connection secret and assumes no AWS
+role. A caller without a `paths` filter can make it a required status check.
+
 A repository's docs site — `@beplus/docs-site` from beplus/docs — is built and
 published to GitHub Pages by one more:
 
