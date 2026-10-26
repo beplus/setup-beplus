@@ -304,10 +304,9 @@ jobs:
           while IFS= read -r package; do
             [ -z "$package" ] && continue
             COUNTER=$((COUNTER + 1))
-            # Extract package name from path (e.g., docs-core from packages/core/docs-core)
-            PACKAGE_NAME=$(basename "$package")
-            # Convert to scoped package name (e.g., @beplus/docs-core)
-            SCOPED_NAME="@beplus/$PACKAGE_NAME"
+            # The package's own name, from its package.json: a folder's name is not the package's
+            # (beplus/i18n's packages/libs/core is @beplus/i18n, not @beplus/core).
+            SCOPED_NAME=$(jq -r '.name' "$package/package.json")
 
             cat > "common/changes/force-bump-$COUNTER.json" << EOF
           {
@@ -588,10 +587,10 @@ jobs:
             let summary = '';
 
             for (const packagePath of packages) {
-              const packageName = path.basename(packagePath);
-              const scopedName = `@beplus/${packageName}`;
               const changelogPath = path.join(process.cwd(), packagePath, 'CHANGELOG.md');
               const packageJsonPath = path.join(process.cwd(), packagePath, 'package.json');
+              // The package's own name: a folder's name is not the package's (packages/libs/core is @beplus/i18n).
+              const scopedName = fs.existsSync(packageJsonPath) ? require(packageJsonPath).name : packagePath;
 
               let packageReleaseNotes = '';
               let version = 'unknown';
