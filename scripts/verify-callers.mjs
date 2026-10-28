@@ -592,13 +592,13 @@ const DB = {
     ],
     stepIntended: COMMON_STEP_INTENDED,
     stepAdded: COMMON_STEP_ADDED,
-    addedIfAbsent: {},
-    removedIfPresent: [
-      {
-        what: 'no build: `beplus db diff` reads the committed schema file and the databases, no compiled schema (Mountaineer\'s copy never built)',
-        match: (s) => s.name === 'Rush build' && /^node common\/scripts\/install-run-rush\.js build --to \S+$/.test(String(s.run ?? '')),
+    addedIfAbsent: {
+      build: {
+        why: 'the build MRKIT\'s copy ran: `beplus db diff` loads the built migrator declaration (cli-plugin-database 0.1.7) to leave out its chains',
+        present: (s) => s.name === 'Rush build' && /^node common\/scripts\/install-run-rush\.js build --to \S+$/.test(String(s.run ?? '')),
       },
-    ],
+    },
+    removedIfPresent: [],
     // Steps whose body became a loop over the environments: run side by side.
     behaviour: {
       guard: { added: ['ENVIRONMENTS'], scenarios: 'guard' },

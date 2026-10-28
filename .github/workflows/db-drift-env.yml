@@ -27,7 +27,10 @@
 # `latest`; empty now installs the repository's pin (beplus.estate.json →
 # cli.version, `be auto`; BE-213), and `vars.BE_CLI_VERSION` still wins when it
 # is set — and the registry check after `beplus npm auth` (`BE_NPM_CHECK`). The
-# copy's `rush build` is gone: `beplus db diff` builds nothing it reads.
+# package is built, as MRKIT's copy built it (Mountaineer's did not): from
+# @beplus/cli-plugin-database 0.1.7, `beplus db diff` hands the tools the
+# repository's migrator declaration (database.migrator), a built module, so both
+# dumps leave out exactly the chains it embeds.
 #
 # Connection strings (read-capable): BE_POSTGRES_URL_DEV, BE_POSTGRES_URL_STAGE,
 # BE_POSTGRES_URL_PROD — secrets, as in the copies. Repository secrets, or
@@ -285,11 +288,21 @@ jobs:
             exit 1
           fi
 
-      # `beplus db diff` needs the repository's @beplus/database-tools installed —
-      # and nothing built: it reads the committed schema file and the databases,
-      # no compiled schema (MRKIT's copy built anyway; Mountaineer's did not).
+      # `beplus db diff` needs the repository's @beplus/database-tools installed.
       - name: Rush install
         run: node common/scripts/install-run-rush.js install --to ${{ needs.plan.outputs.project }}
+
+      # ⚠️ AND BUILT. From @beplus/cli-plugin-database 0.1.7 (with
+      # @beplus/database-tools 0.1.7), `beplus db diff` passes the repository's
+      # migrator declaration (beplus.estate.json → database.migrator, e.g.
+      # @bepluscloud/database/migrate → build/migrate.js), and each dump leaves out
+      # the embedded chains it declares — the same set `db check rebuild --compare`
+      # left out of the committed schema file. Unbuilt, the declaration does not
+      # load and every comparison fails ("could not load the migrator"). With older
+      # tools the build is merely unused. MRKIT's copy always built.
+      - name: Rush build
+        id: build
+        run: node common/scripts/install-run-rush.js build --to ${{ needs.plan.outputs.project }}
 
       # Run every comparison and aggregate, so one failure doesn't hide the others.
       # migrations = committed drizzle/schema.sql (canonical "what migrations produce");
