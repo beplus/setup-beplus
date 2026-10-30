@@ -185,12 +185,18 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           while IFS= read -r package; do
-            if [ -d "$package/dist" ]; then
-              PACKAGE_SIZE=$(du -sh "$package/dist" | cut -f1)
-              PACKAGE_NAME=$(basename "$package")
-              echo "📦 $PACKAGE_NAME: $PACKAGE_SIZE"
-              echo "- \`$PACKAGE_NAME\`: \`$PACKAGE_SIZE\`" >> $GITHUB_STEP_SUMMARY
-            fi
+            [ -z "$package" ] && continue
+            # The package's own name (a folder's name is not the package's), and its build output,
+            # dist/ or build/.
+            PACKAGE_NAME=$(jq -r '.name' "$package/package.json")
+            for out in dist build; do
+              if [ -d "$package/$out" ]; then
+                PACKAGE_SIZE=$(du -sh "$package/$out" | cut -f1)
+                echo "📦 $PACKAGE_NAME: $PACKAGE_SIZE"
+                echo "- \`$PACKAGE_NAME\`: \`$PACKAGE_SIZE\`" >> $GITHUB_STEP_SUMMARY
+                break
+              fi
+            done
           done <<< "$BE_PACKAGES"
 
       - name: Versioning dry run check
@@ -281,14 +287,13 @@ jobs:
 
             let packageSizesMarkdown = '';
             packages.forEach(packagePath => {
-              const distPath = `${packagePath}/dist`;
-              try {
-                const size = execSync(`du -sh ${distPath}`).toString().split('\t')[0];
-                const packageName = path.basename(packagePath);
-                packageSizesMarkdown += `- **${packageName}**: \`${size}\`\n`;
-              } catch (e) {
-                // dist folder doesn't exist, skip
-              }
+              // The package's own name (a folder's name is not the package's), and its build output,
+              // dist/ or build/.
+              const out = ['dist', 'build'].map(dir => `${packagePath}/${dir}`).find(dir => fs.existsSync(dir));
+              if (!out) return;
+              const packageName = JSON.parse(fs.readFileSync(`${packagePath}/package.json`, 'utf8')).name;
+              const size = execSync(`du -sh ${out}`).toString().split('\t')[0];
+              packageSizesMarkdown += `- **${packageName}**: \`${size}\`\n`;
             });
 
             const comment = `## 🚀 Build Summary
