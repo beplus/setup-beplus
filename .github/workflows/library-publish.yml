@@ -526,7 +526,9 @@ jobs:
           set -euo pipefail
           # The token stays in the environment: npm expands ${NODE_AUTH_TOKEN} itself.
           npmrc="${RUNNER_TEMP}/.npmrc-github"
-          printf '%s\n' '@beplus:registry=https://npm.pkg.github.com' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "${npmrc}"
+          # GitHub Packages scopes a package by its repository's owner (@beplus, @bepluscloud), never by one
+          # written here: a package of another scope would go to registry.npmjs.org and need its auth.
+          printf '%s\n' "@${GITHUB_REPOSITORY_OWNER}:registry=https://npm.pkg.github.com" '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "${npmrc}"
 
           # Exit 0 when name@version is in the registry, 1 when it is not; anything else stops the run.
           published() {
@@ -712,7 +714,8 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # The token stays in the environment: npm expands ${NODE_AUTH_TOKEN} itself.
-          printf '%s\n' '@beplus:registry=https://npm.pkg.github.com' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "${RUNNER_TEMP}/.npmrc-github"
+          # The calling repository's owner is its packages' scope there, as on dev.
+          printf '%s\n' "@${GITHUB_REPOSITORY_OWNER}:registry=https://npm.pkg.github.com" '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "${RUNNER_TEMP}/.npmrc-github"
           cat > "${RUNNER_TEMP}/released.cjs" <<'EOF'
           const fs = require('fs');
           const path = require('path');
