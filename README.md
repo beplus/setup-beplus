@@ -119,7 +119,8 @@ and stage and prod publish those same bytes — never a build of their own:
 
 `stage` and `prod` each need, as `dev` does:
 - a GitHub environment with the variables `BE_ENVIRONMENT` and `BE_AWS_ACCOUNT_ID`;
-- the role `github-actions-beplus-<repo>-<env>-npm-publishing` in that account.
+- the role `github-actions-<owner>-<repo>-<env>-npm-publishing` in that account (`<owner>` is the
+  repository's: `beplus` for beplus/*, `bepluscloud` for bepluscloud/*).
 
 They install nothing, so they need no `BE_NPM_TOKEN`.
 
