@@ -2,9 +2,12 @@
 # -------------------------------------------------
 # Thirteen `beplus/*` repositories carried a copy of this file — 4,628 lines whose
 # real differences were four: the package list, the `rush publish --to` list, the
-# OIDC role name (always `github-actions-beplus-<repo>-<ref>-npm-publishing`, so
+# OIDC role name (always `github-actions-<owner>-<repo>-<ref>-npm-publishing`, so
 # it is derived here rather than passed), and whether the force-mode change-file
-# step was live or commented out.
+# step was live or commented out. The owner is the calling repository's
+# (`github.repository_owner`), as GitHubOIDCStack names its roles and as
+# infra-diff.yml derives its own: `beplus` for every beplus/* caller, so their
+# roles are unchanged, and `bepluscloud` for bepluscloud/actions.
 #
 # ⚠️ THAT LAST ONE IS A 6/6 SPLIT AND IS NOT RESOLVED HERE. `beplus/server`
 # commented it out with "seems like with versioning policy set to lockStepVersion
@@ -222,7 +225,7 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-beplus-${{ github.event.repository.name }}-${{ github.ref_name }}-npm-publishing
+          role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.ref_name }}-npm-publishing
           aws-region: us-east-1
 
       - run: aws sts get-caller-identity
@@ -689,7 +692,7 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-beplus-${{ github.event.repository.name }}-${{ github.ref_name }}-npm-publishing
+          role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.ref_name }}-npm-publishing
           aws-region: us-east-1
 
       # `beplus aws codeartifact auth` writes this environment's CodeArtifact repository into
