@@ -29,6 +29,15 @@
 # the build as `DOCS_PROJECTS`. Without the App — a fork's pull request — the site shows the engine's
 # own list; a run whose own repository is not in GitHub's says so in its summary.
 #
+# The docs package: after a publish, the `package` job packs the site it just built into a docs
+# package (`beplus-docs package`, beplus/docs) — every page, the search index, the files the pages
+# point at, the release bundle's Markdown — and publishes it to the CodeArtifact of `package-
+# environment` as `@beplus/<site id>-docs`, version `1.0.0-dev.<UTC time>`, dist-tag `latest`.
+# bepluscloud's console pins those packages for its Products (`app.beplus.cloud/products`), and the
+# desktop's Library reads them. It assumes the repository's npm-publishing role, the one its library
+# releases use; a repository without one still deploys its site, and the summary says the package
+# was not published. `package: false` turns it off.
+#
 # The registry: `@beplus/docs-site` draws with @beplus/uix and FontAwesome Pro, installed from
 # npm.beplus.cloud. The job authenticates it as every other shared workflow here does — the
 # `cli` action's `beplus npm auth`, from `BE_NPM_TARGET` and `BE_NPM_TOKEN` — which writes the
@@ -85,6 +94,26 @@ on:
         required: false
         type: string
         default: "Docs"
+      package:
+        description: "After a publish, also publish the site as a docs package (beplus-docs/package@1, @beplus/<site id>-docs) to the environment's CodeArtifact, for hosts that render it: bepluscloud's Products, the desktop's Library."
+        required: false
+        type: boolean
+        default: true
+      package-environment:
+        description: "The GitHub environment the package job runs in: its BE_ENVIRONMENT, BE_AWS_ACCOUNT_ID and npm-publishing role decide the CodeArtifact."
+        required: false
+        type: string
+        default: "dev"
+      docs-build-version:
+        description: "The @beplus/docs-build that packs the site (any version packs a build from an older engine)."
+        required: false
+        type: string
+        default: "latest"
+      redirect-to:
+        description: "Retire the site: publish, instead of it, a page per route that sends the reader to the same route under this address (e.g. https://app.beplus.cloud/products/beplus/auth/docs/), and a 404 that sends any other path there. Empty publishes the site."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -259,6 +288,52 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Retiring a site (bepluscloud's Products took it over): Pages serves static files only, so each
+      # route becomes a page that sends the reader on — a refresh for a page without script, a replace
+      # that keeps the anchor for one with it, a canonical link for whoever indexes it — and the 404
+      # sends any other path the same way. The docs package above still comes from the real build.
+      - name: Turn the site into redirects
+        if: inputs.redirect-to != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          OUT: ${{ inputs.output }}
+          TARGET: ${{ inputs.redirect-to }}
+          DOCS_BASE: ${{ steps.pages.outputs.base_path }}
+        run: |
+          cp -R "$OUT" docs-site-built
+          node --input-type=module -e '
+            import * as fs from "node:fs";
+            import * as path from "node:path";
+            const out = process.env.OUT;
+            const target = process.env.TARGET.replace(/\/?$/, "/");
+            const base = (process.env.DOCS_BASE || "/").replace(/\/?$/, "/");
+            const manifest = JSON.parse(fs.readFileSync("docs-site-built/manifest.json", "utf8"));
+            const esc = (value) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+            const page = (to) => `<!doctype html><html><head><meta charset="utf-8"><title>Moved</title><link rel="canonical" href="${esc(to)}"><meta http-equiv="refresh" content="0; url=${esc(to)}"><meta name="robots" content="noindex"><script>location.replace(${JSON.stringify(to)} + location.hash)</script></head><body><p>This page moved to <a href="${esc(to)}">${esc(to)}</a>.</p></body></html>\n`;
+            fs.rmSync(out, { recursive: true, force: true });
+            for (const { route } of manifest.routes) {
+              const file = path.join(out, route, "index.html");
+              fs.mkdirSync(path.dirname(file), { recursive: true });
+              fs.writeFileSync(file, page(target + route.replace(/^\//, "")));
+            }
+            const notFound = `<!doctype html><html><head><meta charset="utf-8"><title>Moved</title><meta name="robots" content="noindex"><script>var p = location.pathname; var b = ${JSON.stringify(base)}; if (p.indexOf(b) === 0) p = p.slice(b.length); location.replace(${JSON.stringify(target)} + p.replace(/\\.md$/, "/").replace(/^\\x2F/, "") + location.hash)</script></head><body><p>These docs moved to <a href="${esc(target)}">${esc(target)}</a>.</p></body></html>\n`;
+            fs.writeFileSync(path.join(out, "404.html"), notFound);
+            fs.writeFileSync(path.join(out, ".nojekyll"), "");
+            console.log(`Redirects: ${manifest.routes.length} routes → ${target}`);
+          '
+          {
+            echo "- **Retired**: every route now sends the reader to ${TARGET}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The docs package is still packed from the real build, not from the redirects.
+      - name: Keep the real build for the docs package
+        if: inputs.redirect-to != '' && steps.publish.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-site-built
+          path: ${{ inputs.working-directory }}/docs-site-built
+          retention-days: 1
+
       - name: Upload the site
         if: steps.publish.outputs.publish == 'true'
         uses: actions/upload-pages-artifact@v3
@@ -281,3 +356,92 @@ jobs:
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
+
+  package:
+    name: Publish the docs package
+    needs: build
+    if: needs.build.outputs.publish == 'true' && inputs.package
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.package-environment }}
+    # The site is already up: a package that cannot be published fails here, never the deploy.
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
+    steps:
+      # The site the build job uploaded for Pages: the same bytes Pages serves.
+      - name: Fetch the built site
+        uses: actions/download-artifact@v4
+        with:
+          # A retired site uploads redirects to Pages, and its real build beside them.
+          name: ${{ inputs.redirect-to != '' && 'docs-site-built' || 'github-pages' }}
+          path: artifact
+
+      - name: Unpack it
+        run: |
+          mkdir -p site
+          if [ -f artifact/artifact.tar ]; then tar -xf artifact/artifact.tar -C site; else cp -R artifact/. site/; fi
+          test -f site/manifest.json || { echo "::error::The site has no manifest.json — is it a beplus docs site?"; exit 1; }
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Check for a registry role
+        id: role
+        env:
+          ACCOUNT: ${{ vars.BE_AWS_ACCOUNT_ID }}
+        run: |
+          if [ -z "$ACCOUNT" ] || [ -z "$BE_ENVIRONMENT" ]; then
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The '${{ inputs.package-environment }}' environment has no BE_AWS_ACCOUNT_ID or BE_ENVIRONMENT: the docs package is not published."
+          else
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.role.outputs.has == 'true'
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ inputs.package-environment }}-npm-publishing
+          aws-region: us-east-1
+
+      - uses: beplus/setup-beplus/cli@v2
+        if: steps.role.outputs.has == 'true'
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
+          BE_NPM_AUTH: true
+
+      - name: Pack the docs package
+        if: steps.role.outputs.has == 'true'
+        id: pack
+        env:
+          DOCS_BUILD: ${{ inputs.docs-build-version }}
+        run: |
+          version="1.0.0-dev.$(date -u +%Y%m%d%H%M%S)"
+          npx -y -p "@beplus/docs-build@${DOCS_BUILD}" beplus-docs package \
+            --from site --out docs-package --name auto --version "$version" \
+            --commit "$GITHUB_SHA"
+          echo "name=$(node -p "require('./docs-package/package.json').name")" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Publish it to CodeArtifact
+        if: steps.role.outputs.has == 'true'
+        env:
+          NAME: ${{ steps.pack.outputs.name }}
+          VERSION: ${{ steps.pack.outputs.version }}
+        run: |
+          beplus aws codeartifact auth --env "${BE_ENVIRONMENT}"
+          npm publish docs-package --tag latest
+          {
+            echo "### Docs package"
+            echo
+            echo "- **Package**: \`${NAME}@${VERSION}\` in ${BE_ENVIRONMENT}'s CodeArtifact (dist-tag \`latest\`)"
+            echo "- **Pages**: $(node -p "require('./docs-package/bundle.json').files.filter((f) => f.route).length")"
+            echo "- **Size**: $(du -sh docs-package | cut -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+

@@ -331,6 +331,23 @@ other repositories with the org's `beplus` App — `BE_GITHUB_APP_ID` (variable)
 and `BE_GITHUB_APP_PRIVATE_KEY` (secret), with Metadata, Pages and custom
 properties read. Without them the site shows the engine's own list.
 
+After a publish, the `package` job also publishes the site as a **docs package**
+(`beplus-docs package`, `beplus-docs/package@1`): every rendered page, the
+search index, the files the pages point at and the release bundle's Markdown,
+as `@beplus/<site id>-docs@1.0.0-dev.<UTC time>` (dist-tag `latest`) in the
+CodeArtifact of `package-environment` (`dev`). bepluscloud's console pins these
+packages for its Products, and the desktop's Library reads them. The job runs in
+that GitHub environment and assumes the repository's npm-publishing role, the
+one its library releases use. Without a role it says so in the summary, and the
+site deploys all the same. `package: false` turns it off; `docs-build-version`
+picks the `@beplus/docs-build` that packs (`latest`).
+
+To retire a site, set `redirect-to` to where its pages now live
+(`https://app.beplus.cloud/products/beplus/<id>/docs/`). The build runs as
+before and still publishes the docs package, but Pages then serves a page per
+route that sends the reader to the same route there, and a 404 that sends any
+other path the same way.
+
 What an agent reads of that site goes onto the package's GitHub release too:
 `docs-bundle.yml` packs the build into `docs-bundle.tgz` (`beplus-docs pack`,
 the `beplus-docs/release-bundle@1` contract) and attaches it, where bepluscloud's
