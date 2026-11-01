@@ -25,6 +25,13 @@
 #                 earlier one dev released that the CodeArtifact lacks. prod alone turns the GitHub
 #                 releases into full releases.
 #
+# The repository's docs package goes the same way. docs-pages.yml publishes its portal as
+# `@<owner>/<site id>-docs` to GitHub Packages and dev's CodeArtifact, recording the commit it was
+# built from (`gitHead`); stage and prod promote the newest version whose commit their branch holds,
+# and every earlier one they lack, with the libraries. A repository whose libraries release another
+# way, or that has none, calls this on stage and prod only with `libraries: false`: its promotion
+# then carries the docs package alone.
+#
 # The caller triggers on every push to dev, stage and prod, with no `paths` filter (see `plan`); on
 # any other branch this does nothing.
 #
@@ -97,6 +104,14 @@ on:
         required: false
         type: string
         default: "us-east-1"
+      libraries:
+        description: >-
+          false: this repository's libraries release another way (cli_v2's release-binary.yml), or
+          it has none, so a promotion carries its docs package alone. Such a caller triggers on stage
+          and prod only, and passes `packages: ""`, `publish-to: ""`, `force-change-files: false`.
+        required: false
+        type: boolean
+        default: true
       # Every library publishes one way now. The input stays so a caller that still passes it keeps
       # working: a reusable workflow refuses an input it does not declare.
       promote:
@@ -652,8 +667,11 @@ jobs:
       BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
 
     steps:
+      # The whole history: a docs version is promoted once this branch holds the commit it was built from.
       - name: Checkout monorepo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -670,6 +688,7 @@ jobs:
       # Every project Rush publishes (`shouldPublish`, or a version policy), at the version its
       # package.json carries at this commit. rush.json is JSONC, read as library-ci.yml reads it.
       - name: List the packages to promote
+        if: inputs.libraries
         run: |
           cat > "${RUNNER_TEMP}/packages.cjs" <<'EOF'
           const fs = require('fs');
@@ -689,7 +708,88 @@ jobs:
           EOF
           node "${RUNNER_TEMP}/packages.cjs" > "${RUNNER_TEMP}/promote.txt"
           cat "${RUNNER_TEMP}/promote.txt"
-          [ -s "${RUNNER_TEMP}/promote.txt" ] || { echo "::error::rush.json lists no package to publish."; exit 1; }
+          [ -s "${RUNNER_TEMP}/promote.txt" ] || { echo "::error::rush.json lists no package to publish. A repository with no library calls this with libraries: false."; exit 1; }
+
+      # docs.txt: the repository's docs package at the newest version GitHub Packages has whose commit
+      # (`gitHead`, which docs-pages.yml records) this branch holds, one `<name>@<version>` line; empty
+      # when its portal published none yet. It goes on as a library's version does: the earlier ones
+      # this CodeArtifact lacks catch up, oldest first. Its name is the one docs-pages.yml gives it,
+      # `@<owner>/<site id>-docs`, the site id from packages/sites/*/docs.config.*.
+      - name: List the docs package to promote
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIBRARIES: ${{ inputs.libraries }}
+        run: |
+          # The token stays in the environment: npm expands ${NODE_AUTH_TOKEN} itself.
+          printf '%s\n' "@${GITHUB_REPOSITORY_OWNER}:registry=https://npm.pkg.github.com" '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "${RUNNER_TEMP}/.npmrc-github"
+          touch "${RUNNER_TEMP}/promote.txt"
+          cat > "${RUNNER_TEMP}/docs.cjs" <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const { execFileSync } = require('child_process');
+          const semver = require(path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'npm', 'node_modules', 'semver'));
+          const github = ['--userconfig', path.join(process.env.RUNNER_TEMP, '.npmrc-github')];
+
+          // The portal's site id, as docs.config declares it: `site: { id: 'auth', … }`.
+          const siteId = () => {
+            const sites = path.join('packages', 'sites');
+            for (const dir of fs.existsSync(sites) ? fs.readdirSync(sites).sort() : []) {
+              for (const file of ['docs.config.ts', 'docs.config.mts', 'docs.config.mjs', 'docs.config.js']) {
+                const config = path.join(sites, dir, file);
+                if (!fs.existsSync(config)) continue;
+                const id = /\bsite\s*:\s*\{[\s\S]*?\bid\s*:\s*['"`]([a-z0-9][a-z0-9-]*)['"`]/.exec(fs.readFileSync(config, 'utf8'));
+                if (id) return id[1];
+              }
+            }
+            return null;
+          };
+          const npmView = (args) => {
+            try {
+              return execFileSync('npm', ['view', ...args, ...github], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+            } catch (error) {
+              const out = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+              if (out.includes('E404')) return null;
+              console.log(`::error::npm view ${args.join(' ')}: ${out.trim() || error.message}`);
+              process.exit(1);
+            }
+          };
+          const holds = (commit) => {
+            try {
+              execFileSync('git', ['merge-base', '--is-ancestor', commit, 'HEAD'], { stdio: 'ignore' });
+              return true;
+            } catch {
+              return false;
+            }
+          };
+
+          const out = path.join(process.env.RUNNER_TEMP, 'docs.txt');
+          fs.writeFileSync(out, '');
+          const id = siteId();
+          if (!id) {
+            console.log('No portal here (packages/sites/*/docs.config.*): no docs package to promote.');
+            process.exit(0);
+          }
+          const name = `@${process.env.GITHUB_REPOSITORY_OWNER}/${id}-docs`;
+          const listed = npmView([name, 'versions', '--json']);
+          const versions = listed ? semver.rsort([].concat(JSON.parse(listed))) : [];
+          if (!versions.length) {
+            console.log(`${name}: GitHub Packages has no version yet; its portal publishes one on its next deploy.`);
+            process.exit(0);
+          }
+          for (const version of versions) {
+            const commit = npmView([`${name}@${version}`, 'gitHead']);
+            if (commit && /^[0-9a-f]{40}$/.test(commit) && holds(commit)) {
+              console.log(`${name}@${version}: built from ${commit.slice(0, 7)}, which this branch holds`);
+              fs.writeFileSync(out, `${name}@${version}\n`);
+              process.exit(0);
+            }
+          }
+          console.log(`${name}: no version was built from a commit this branch holds yet.`);
+          EOF
+          node "${RUNNER_TEMP}/docs.cjs"
+          if [ "$LIBRARIES" = "false" ] && [ ! -s "${RUNNER_TEMP}/docs.txt" ]; then
+            echo "Nothing to promote: no library (libraries: false), and no docs version this branch holds."
+          fi
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -752,7 +852,8 @@ jobs:
           const lines = [];
           const tagged = [];
           let refused = false;
-          for (const spec of fs.readFileSync(path.join(temp, 'promote.txt'), 'utf8').split('\n').filter(Boolean)) {
+          const specs = ['promote.txt', 'docs.txt'].flatMap((file) => fs.readFileSync(path.join(temp, file), 'utf8').split('\n').filter(Boolean));
+          for (const spec of specs) {
             const at = spec.lastIndexOf('@');
             const [name, version] = [spec.slice(0, at), spec.slice(at + 1)];
             // The version this commit carries: GitHub Packages has it, or dev never released it.
@@ -852,7 +953,7 @@ jobs:
           while IFS= read -r spec; do
             npm dist-tag add "$spec" "$DIST_TAG" --userconfig "${RUNNER_TEMP}/.npmrc-github" \
               || echo "::warning::GitHub Packages did not tag ${spec} ${DIST_TAG}."
-          done < "${RUNNER_TEMP}/promote.txt"
+          done < <(cat "${RUNNER_TEMP}/promote.txt" "${RUNNER_TEMP}/docs.txt")
 
       # Every version prod now has of those dev released up to this commit, so a release an earlier
       # promotion left a pre-release becomes a full release too. One listing finds the pre-releases.
