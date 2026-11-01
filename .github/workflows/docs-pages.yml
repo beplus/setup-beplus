@@ -429,14 +429,34 @@ jobs:
           echo "name=$(node -p "require('./docs-package/package.json').name")" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # As library-publish.yml publishes a library: this environment's CodeArtifact written into
+      # ~/.npmrc by `beplus aws codeartifact auth`, then the packed tarball, by its path. A bare
+      # folder name is no path to npm: `npm publish docs-package` looks up a package of that name on
+      # registry.npmjs.org.
       - name: Publish it to CodeArtifact
         if: steps.role.outputs.has == 'true'
         env:
           NAME: ${{ steps.pack.outputs.name }}
           VERSION: ${{ steps.pack.outputs.version }}
         run: |
+          set -euo pipefail
           beplus aws codeartifact auth --env "${BE_ENVIRONMENT}"
-          npm publish docs-package --tag latest
+
+          # Exit 0 when name@version is in the registry, 1 when it is not; anything else stops the run.
+          published() {
+            local out
+            if out=$(npm view "$1" version "${@:2}" 2>&1); then [ -n "$out" ]; return; fi
+            echo "$out" | grep -q E404 && return 1
+            echo "::error::Cannot tell whether $1 is published: $out"; exit 1
+          }
+          mkdir -p npm
+          file=$(npm pack ./docs-package --pack-destination npm | tail -n 1)
+          if published "${NAME}@${VERSION}"; then
+            echo "Skipping ${NAME}@${VERSION}: already in CodeArtifact"
+          else
+            echo "Publishing ${NAME}@${VERSION} to CodeArtifact (dist-tag latest)"
+            npm publish "./npm/${file}" --tag latest
+          fi
           {
             echo "### Docs package"
             echo
