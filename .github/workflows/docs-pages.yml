@@ -31,12 +31,18 @@
 #
 # The docs package: after a publish, the `package` job packs the site it just built into a docs
 # package (`beplus-docs package`, beplus/docs) — every page, the search index, the files the pages
-# point at, the release bundle's Markdown — and publishes it to the CodeArtifact of `package-
-# environment` as `@beplus/<site id>-docs`, version `1.0.0-dev.<UTC time>`, dist-tag `latest`.
+# point at, the release bundle's Markdown — as `@beplus/<site id>-docs`, version
+# `1.0.0-dev.<UTC time>`, and publishes it as library-publish.yml releases a library: GitHub
+# Packages first (dist-tag `dev`), then the CodeArtifact of `package-environment` (`latest`). It
+# records the commit it was built from (`gitHead`), so library-publish.yml's promotion carries it to
+# stage's and prod's CodeArtifact on the same fast-forward as the repository's libraries.
 # bepluscloud's console pins those packages for its Products (`app.beplus.cloud/products`), and the
 # desktop's Library reads them. It assumes the repository's npm-publishing role, the one its library
 # releases use; a repository without one still deploys its site, and the summary says the package
 # was not published. `package: false` turns it off.
+#
+# ⚠️ The caller grants `packages: write` (as its publish workflow does), for GitHub Packages. A
+# caller that does not cannot start this workflow at all, its Pages deploy included.
 #
 # The registry: `@beplus/docs-site` draws with @beplus/uix and FontAwesome Pro, installed from
 # npm.beplus.cloud. The job authenticates it as every other shared workflow here does — the
@@ -368,6 +374,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      # GitHub Packages, where every promotion fetches the package from.
+      packages: write
     env:
       BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
     steps:
@@ -426,21 +434,31 @@ jobs:
           npx -y -p "@beplus/docs-build@${DOCS_BUILD}" beplus-docs package \
             --from site --out docs-package --name auto --version "$version" \
             --commit "$GITHUB_SHA"
+          # The commit it was built from, which promotion reads: a version is promoted to stage or
+          # prod once that branch holds its commit. And its repository, which GitHub Packages links it to.
+          (cd docs-package && npm pkg set gitHead="$GITHUB_SHA" repository.type=git \
+            repository.url="git+https://github.com/${GITHUB_REPOSITORY}.git")
           echo "name=$(node -p "require('./docs-package/package.json').name")" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # As library-publish.yml publishes a library: this environment's CodeArtifact written into
-      # ~/.npmrc by `beplus aws codeartifact auth`, then the packed tarball, by its path. A bare
-      # folder name is no path to npm: `npm publish docs-package` looks up a package of that name on
-      # registry.npmjs.org.
-      - name: Publish it to CodeArtifact
+      # As library-publish.yml publishes a library: the packed tarball, by its path, to GitHub
+      # Packages first (dist-tag `dev`), where every promotion fetches it from, then to this
+      # environment's CodeArtifact (`latest`), written into ~/.npmrc by `beplus aws codeartifact
+      # auth`. A bare folder name is no path to npm: `npm publish docs-package` looks up a package of
+      # that name on registry.npmjs.org.
+      - name: Publish it to GitHub Packages, then CodeArtifact
         if: steps.role.outputs.has == 'true'
         env:
           NAME: ${{ steps.pack.outputs.name }}
           VERSION: ${{ steps.pack.outputs.version }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           beplus aws codeartifact auth --env "${BE_ENVIRONMENT}"
+          # The token stays in the environment: npm expands ${NODE_AUTH_TOKEN} itself. GitHub Packages
+          # scopes a package by its repository's owner, as library-publish.yml writes it.
+          npmrc="${RUNNER_TEMP}/.npmrc-github"
+          printf '%s\n' "@${GITHUB_REPOSITORY_OWNER}:registry=https://npm.pkg.github.com" '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "${npmrc}"
 
           # Exit 0 when name@version is in the registry, 1 when it is not; anything else stops the run.
           published() {
@@ -451,6 +469,12 @@ jobs:
           }
           mkdir -p npm
           file=$(npm pack ./docs-package --pack-destination npm | tail -n 1)
+          if published "${NAME}@${VERSION}" --userconfig "${npmrc}"; then
+            echo "Skipping ${NAME}@${VERSION}: already in GitHub Packages"
+          else
+            echo "Publishing ${NAME}@${VERSION} to GitHub Packages (dist-tag dev)"
+            npm publish "./npm/${file}" --tag dev --userconfig "${npmrc}"
+          fi
           if published "${NAME}@${VERSION}"; then
             echo "Skipping ${NAME}@${VERSION}: already in CodeArtifact"
           else
@@ -460,7 +484,7 @@ jobs:
           {
             echo "### Docs package"
             echo
-            echo "- **Package**: \`${NAME}@${VERSION}\` in ${BE_ENVIRONMENT}'s CodeArtifact (dist-tag \`latest\`)"
+            echo "- **Package**: \`${NAME}@${VERSION}\` in GitHub Packages (dist-tag \`dev\`) and ${BE_ENVIRONMENT}'s CodeArtifact (\`latest\`); stage and prod get it when their branch holds commit \`${GITHUB_SHA::7}\`"
             echo "- **Pages**: $(node -p "require('./docs-package/bundle.json').files.filter((f) => f.route).length")"
             echo "- **Size**: $(du -sh docs-package | cut -f1)"
           } >> "$GITHUB_STEP_SUMMARY"

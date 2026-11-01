@@ -95,6 +95,17 @@ and stage and prod publish those same bytes — never a build of their own:
   `npm-publishing` role; a tag a run could not remove goes on the next one. GitHub
   Packages is the one registry every environment shares, so its tags show how far a
   version got.
+- **The repository's docs package goes the same way.** docs-pages.yml publishes
+  its portal as `@<owner>/<site id>-docs` to GitHub Packages and dev's CodeArtifact,
+  recording the commit it was built from (`gitHead`). A promotion carries the newest
+  version whose commit that branch holds, and every earlier one the environment
+  lacks, with the libraries. The name comes from `packages/sites/*/docs.config.*`'s
+  `site.id`; a repository with no portal promotes its libraries alone.
+- **A repository with no library here** (its libraries release another way, as
+  cli_v2's do, or it has none) still promotes its docs package: its publish
+  workflow triggers on `stage` and `prod` only and calls this with
+  `libraries: false`, `packages: ""`, `publish-to: ""` and
+  `force-change-files: false`.
 - **No `[skip ci]` on the version commit.** GitHub skips a push whose head commit
   says `[skip ci]`, and stage and prod fast-forward to exactly that commit. The dev
   run skips the version commit by its message instead.
@@ -334,13 +345,21 @@ properties read. Without them the site shows the engine's own list.
 After a publish, the `package` job also publishes the site as a **docs package**
 (`beplus-docs package`, `beplus-docs/package@1`): every rendered page, the
 search index, the files the pages point at and the release bundle's Markdown,
-as `@beplus/<site id>-docs@1.0.0-dev.<UTC time>` (dist-tag `latest`) in the
-CodeArtifact of `package-environment` (`dev`). bepluscloud's console pins these
-packages for its Products, and the desktop's Library reads them. The job runs in
-that GitHub environment and assumes the repository's npm-publishing role, the
-one its library releases use. Without a role it says so in the summary, and the
-site deploys all the same. `package: false` turns it off; `docs-build-version`
-picks the `@beplus/docs-build` that packs (`latest`).
+as `@beplus/<site id>-docs@1.0.0-dev.<UTC time>`. It goes out as a library's
+version does: GitHub Packages first (dist-tag `dev`), then the CodeArtifact of
+`package-environment` (`dev`, dist-tag `latest`), with the commit it was built
+from as its `gitHead`. stage and prod get it from the repository's promotion
+(library-publish.yml), once their branch holds that commit. bepluscloud's console
+pins these packages for its Products, and the desktop's Library reads them. The
+job runs in that GitHub environment and assumes the repository's npm-publishing
+role, the one its library releases use. Without a role it says so in the
+summary, and the site deploys all the same. `package: false` turns it off;
+`docs-build-version` picks the `@beplus/docs-build` that packs (`latest`).
+
+⚠️ **The caller grants `packages: write`** to the job that calls docs-pages.yml,
+for GitHub Packages, as its publish workflow does. A caller that does not cannot
+start the workflow at all, its Pages deploy included: grant it before moving `v2`
+past a docs-pages.yml that asks for it.
 
 To retire a site, set `redirect-to` to where its pages now live
 (`https://app.beplus.cloud/products/beplus/<id>/docs/`). The build runs as
