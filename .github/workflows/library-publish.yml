@@ -753,6 +753,17 @@ jobs:
               process.exit(1);
             }
           };
+          // Every version GitHub Packages has of the docs package. `npm view` answers only for a
+          // version its spec matches, `latest` when it names none, and prints nothing for a package
+          // without `latest`. docs-pages.yml publishes there with `--tag dev` only, so the spec names
+          // `dev` first, then `latest`, as the libraries' listing below does.
+          const versionsOf = (name) => {
+            for (const spec of [`${name}@dev`, name]) {
+              const listed = npmView([spec, 'versions', '--json']);
+              if (listed) return [].concat(JSON.parse(listed));
+            }
+            return [];
+          };
           const holds = (commit) => {
             try {
               execFileSync('git', ['merge-base', '--is-ancestor', commit, 'HEAD'], { stdio: 'ignore' });
@@ -770,8 +781,7 @@ jobs:
             process.exit(0);
           }
           const name = `@${process.env.GITHUB_REPOSITORY_OWNER}/${id}-docs`;
-          const listed = npmView([name, 'versions', '--json']);
-          const versions = listed ? semver.rsort([].concat(JSON.parse(listed))) : [];
+          const versions = semver.rsort(versionsOf(name));
           if (!versions.length) {
             console.log(`${name}: GitHub Packages has no version yet; its portal publishes one on its next deploy.`);
             process.exit(0);
