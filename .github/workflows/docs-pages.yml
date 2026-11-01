@@ -29,6 +29,15 @@
 # the build as `DOCS_PROJECTS`. Without the App — a fork's pull request — the site shows the engine's
 # own list; a run whose own repository is not in GitHub's says so in its summary.
 #
+# The docs package: after a publish, the `package` job packs the site it just built into a docs
+# package (`beplus-docs package`, beplus/docs) — every page, the search index, the files the pages
+# point at, the release bundle's Markdown — and publishes it to the CodeArtifact of `package-
+# environment` as `@beplus/<site id>-docs`, version `1.0.0-dev.<UTC time>`, dist-tag `latest`.
+# bepluscloud's console pins those packages for its Products (`app.beplus.cloud/products`), and the
+# desktop's Library reads them. It assumes the repository's npm-publishing role, the one its library
+# releases use; a repository without one still deploys its site, and the summary says the package
+# was not published. `package: false` turns it off.
+#
 # The registry: `@beplus/docs-site` draws with @beplus/uix and FontAwesome Pro, installed from
 # npm.beplus.cloud. The job authenticates it as every other shared workflow here does — the
 # `cli` action's `beplus npm auth`, from `BE_NPM_TARGET` and `BE_NPM_TOKEN` — which writes the
@@ -85,6 +94,21 @@ on:
         required: false
         type: string
         default: "Docs"
+      package:
+        description: "After a publish, also publish the site as a docs package (beplus-docs/package@1, @beplus/<site id>-docs) to the environment's CodeArtifact, for hosts that render it: bepluscloud's Products, the desktop's Library."
+        required: false
+        type: boolean
+        default: true
+      package-environment:
+        description: "The GitHub environment the package job runs in: its BE_ENVIRONMENT, BE_AWS_ACCOUNT_ID and npm-publishing role decide the CodeArtifact."
+        required: false
+        type: string
+        default: "dev"
+      docs-build-version:
+        description: "The @beplus/docs-build that packs the site (any version packs a build from an older engine)."
+        required: false
+        type: string
+        default: "latest"
 
 permissions:
   contents: read
@@ -281,3 +305,91 @@ jobs:
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
+
+  package:
+    name: Publish the docs package
+    needs: build
+    if: needs.build.outputs.publish == 'true' && inputs.package
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.package-environment }}
+    # The site is already up: a package that cannot be published fails here, never the deploy.
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
+    steps:
+      # The site the build job uploaded for Pages: the same bytes Pages serves.
+      - name: Fetch the built site
+        uses: actions/download-artifact@v4
+        with:
+          name: github-pages
+          path: artifact
+
+      - name: Unpack it
+        run: |
+          mkdir -p site
+          tar -xf artifact/artifact.tar -C site
+          test -f site/manifest.json || { echo "::error::The site has no manifest.json — is it a beplus docs site?"; exit 1; }
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Check for a registry role
+        id: role
+        env:
+          ACCOUNT: ${{ vars.BE_AWS_ACCOUNT_ID }}
+        run: |
+          if [ -z "$ACCOUNT" ] || [ -z "$BE_ENVIRONMENT" ]; then
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The '${{ inputs.package-environment }}' environment has no BE_AWS_ACCOUNT_ID or BE_ENVIRONMENT: the docs package is not published."
+          else
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.role.outputs.has == 'true'
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.BE_AWS_ACCOUNT_ID }}:role/github-actions-${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ inputs.package-environment }}-npm-publishing
+          aws-region: us-east-1
+
+      - uses: beplus/setup-beplus/cli@v2
+        if: steps.role.outputs.has == 'true'
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
+          BE_NPM_AUTH: true
+
+      - name: Pack the docs package
+        if: steps.role.outputs.has == 'true'
+        id: pack
+        env:
+          DOCS_BUILD: ${{ inputs.docs-build-version }}
+        run: |
+          version="1.0.0-dev.$(date -u +%Y%m%d%H%M%S)"
+          npx -y -p "@beplus/docs-build@${DOCS_BUILD}" beplus-docs package \
+            --from site --out docs-package --name auto --version "$version" \
+            --commit "$GITHUB_SHA"
+          echo "name=$(node -p "require('./docs-package/package.json').name")" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Publish it to CodeArtifact
+        if: steps.role.outputs.has == 'true'
+        env:
+          NAME: ${{ steps.pack.outputs.name }}
+          VERSION: ${{ steps.pack.outputs.version }}
+        run: |
+          beplus aws codeartifact auth --env "${BE_ENVIRONMENT}"
+          npm publish docs-package --tag latest
+          {
+            echo "### Docs package"
+            echo
+            echo "- **Package**: \`${NAME}@${VERSION}\` in ${BE_ENVIRONMENT}'s CodeArtifact (dist-tag \`latest\`)"
+            echo "- **Pages**: $(node -p "require('./docs-package/bundle.json').files.filter((f) => f.route).length")"
+            echo "- **Size**: $(du -sh docs-package | cut -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
