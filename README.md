@@ -342,6 +342,12 @@ one its library releases use. Without a role it says so in the summary, and the
 site deploys all the same. `package: false` turns it off; `docs-build-version`
 picks the `@beplus/docs-build` that packs (`latest`).
 
+To retire a site, set `redirect-to` to where its pages now live
+(`https://app.beplus.cloud/products/beplus/<id>/docs/`). The build runs as
+before and still publishes the docs package, but Pages then serves a page per
+route that sends the reader to the same route there, and a 404 that sends any
+other path the same way.
+
 What an agent reads of that site goes onto the package's GitHub release too:
 `docs-bundle.yml` packs the build into `docs-bundle.tgz` (`beplus-docs pack`,
 the `beplus-docs/release-bundle@1` contract) and attaches it, where bepluscloud's

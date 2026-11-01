@@ -109,6 +109,11 @@ on:
         required: false
         type: string
         default: "latest"
+      redirect-to:
+        description: "Retire the site: publish, instead of it, a page per route that sends the reader to the same route under this address (e.g. https://app.beplus.cloud/products/beplus/auth/docs/), and a 404 that sends any other path there. Empty publishes the site."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -283,6 +288,52 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Retiring a site (bepluscloud's Products took it over): Pages serves static files only, so each
+      # route becomes a page that sends the reader on — a refresh for a page without script, a replace
+      # that keeps the anchor for one with it, a canonical link for whoever indexes it — and the 404
+      # sends any other path the same way. The docs package above still comes from the real build.
+      - name: Turn the site into redirects
+        if: inputs.redirect-to != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          OUT: ${{ inputs.output }}
+          TARGET: ${{ inputs.redirect-to }}
+          DOCS_BASE: ${{ steps.pages.outputs.base_path }}
+        run: |
+          cp -R "$OUT" docs-site-built
+          node --input-type=module -e '
+            import * as fs from "node:fs";
+            import * as path from "node:path";
+            const out = process.env.OUT;
+            const target = process.env.TARGET.replace(/\/?$/, "/");
+            const base = (process.env.DOCS_BASE || "/").replace(/\/?$/, "/");
+            const manifest = JSON.parse(fs.readFileSync("docs-site-built/manifest.json", "utf8"));
+            const esc = (value) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+            const page = (to) => `<!doctype html><html><head><meta charset="utf-8"><title>Moved</title><link rel="canonical" href="${esc(to)}"><meta http-equiv="refresh" content="0; url=${esc(to)}"><meta name="robots" content="noindex"><script>location.replace(${JSON.stringify(to)} + location.hash)</script></head><body><p>This page moved to <a href="${esc(to)}">${esc(to)}</a>.</p></body></html>\n`;
+            fs.rmSync(out, { recursive: true, force: true });
+            for (const { route } of manifest.routes) {
+              const file = path.join(out, route, "index.html");
+              fs.mkdirSync(path.dirname(file), { recursive: true });
+              fs.writeFileSync(file, page(target + route.replace(/^\//, "")));
+            }
+            const notFound = `<!doctype html><html><head><meta charset="utf-8"><title>Moved</title><meta name="robots" content="noindex"><script>var p = location.pathname; var b = ${JSON.stringify(base)}; if (p.indexOf(b) === 0) p = p.slice(b.length); location.replace(${JSON.stringify(target)} + p.replace(/\\.md$/, "/").replace(/^\\x2F/, "") + location.hash)</script></head><body><p>These docs moved to <a href="${esc(target)}">${esc(target)}</a>.</p></body></html>\n`;
+            fs.writeFileSync(path.join(out, "404.html"), notFound);
+            fs.writeFileSync(path.join(out, ".nojekyll"), "");
+            console.log(`Redirects: ${manifest.routes.length} routes → ${target}`);
+          '
+          {
+            echo "- **Retired**: every route now sends the reader to ${TARGET}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The docs package is still packed from the real build, not from the redirects.
+      - name: Keep the real build for the docs package
+        if: inputs.redirect-to != '' && steps.publish.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-site-built
+          path: ${{ inputs.working-directory }}/docs-site-built
+          retention-days: 1
+
       - name: Upload the site
         if: steps.publish.outputs.publish == 'true'
         uses: actions/upload-pages-artifact@v3
@@ -324,13 +375,14 @@ jobs:
       - name: Fetch the built site
         uses: actions/download-artifact@v4
         with:
-          name: github-pages
+          # A retired site uploads redirects to Pages, and its real build beside them.
+          name: ${{ inputs.redirect-to != '' && 'docs-site-built' || 'github-pages' }}
           path: artifact
 
       - name: Unpack it
         run: |
           mkdir -p site
-          tar -xf artifact/artifact.tar -C site
+          if [ -f artifact/artifact.tar ]; then tar -xf artifact/artifact.tar -C site; else cp -R artifact/. site/; fi
           test -f site/manifest.json || { echo "::error::The site has no manifest.json — is it a beplus docs site?"; exit 1; }
 
       - uses: actions/setup-node@v6
