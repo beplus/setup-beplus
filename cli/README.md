@@ -98,7 +98,9 @@ and pnpm fails minutes later with `ERR_PNPM_TARBALL_INTEGRITY`, then
 
 `BE_NPM_CHECK` closes that gap. After the auth, it asks the registry for every
 `@beplus` dependency of the packages you name (`dependencies`,
-`devDependencies`, `optionalDependencies`; `workspace:` ones are skipped) —
+`devDependencies`, `optionalDependencies`; `workspace:` ones are skipped, and an
+npm alias such as `"@beplus/docs-legacy": "npm:@beplus/docs@0.4.2"` is asked for
+as the package after `npm:`) —
 through the registry Rush hands pnpm (`common/config/rush/.npmrc`), else npm's
 own — and fails the step unless each comes back as a real package, naming the
 cause: the stub (no token, or a refused one), or npm's own error (a 404 for a
