@@ -205,8 +205,11 @@ runs:
           [ "$registry" != undefined ] || registry="npm's default registry (nothing maps @beplus)"
         fi
 
-        # Each package's direct @beplus dependencies. A workspace project is
-        # built, not fetched.
+        # Each package's direct @beplus dependencies, by the package the registry
+        # serves: an npm alias (`"@beplus/docs-legacy": "npm:@beplus/docs@0.4.2"`)
+        # is fetched as the package after `npm:`, so that is the one to ask for,
+        # and an alias to a package outside @beplus is not ours to check. A
+        # workspace project is built, not fetched.
         deps=""
         for dir in $CHECK; do
           if [ ! -f "$dir/package.json" ]; then
@@ -216,8 +219,10 @@ runs:
           deps+="$(jq -r '
             [.dependencies, .devDependencies, .optionalDependencies]
             | map(objects | to_entries[]) | .[]
-            | select((.key | startswith("@beplus/")) and ((.value | tostring) | startswith("workspace:") | not))
-            | .key' "$dir/package.json")"$'\n'
+            | (.value | tostring) as $spec
+            | select($spec | startswith("workspace:") | not)
+            | (if ($spec | startswith("npm:")) then ($spec | capture("^npm:(?<name>@?[^@]+)").name) else .key end)
+            | select(startswith("@beplus/"))' "$dir/package.json")"$'\n'
         done
         mapfile -t wanted < <(printf '%s' "$deps" | sed '/^$/d' | sort -u)
         if [ "${#wanted[@]}" -eq 0 ]; then
