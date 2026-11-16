@@ -23,7 +23,7 @@ Composite GitHub Action that installs [@beplus/be](https://github.com/beplus/be)
 |------|----------|---------|-------------|
 | `BE_CLI_VERSION` | No | empty | Version or channel of beplus CLI to install (passed to `be`). Empty installs the repository's pin (`be auto`), or `latest` with a warning when there is none. A value here wins over the pin. |
 | `BE_NPM_AUTH` | No | `false` | If `true`, runs `beplus npm auth` |
-| `BE_NPM_CHECK` | No | empty | Package directories (space- or newline-separated, relative to the workspace) whose `@beplus` dependencies must come back from the registry as real packages. Needs `npm` and `jq`. Empty: no check. |
+| `BE_NPM_CHECK` | No | empty | Package directories (space- or newline-separated, relative to the workspace) whose `@beplus` dependencies name the probe: ONE of them must come back from the registry as a real package (the token reached the job and was taken). Needs `npm` and `jq`. Empty: no check. |
 | `BE_PREFIX` | No | empty | Install prefix for beplus binaries. If empty, defaults to `$HOME/.beplus`. Must be writable. |
 | `BE_WORKING_DIRECTORY` | No | the workspace | Where the pin is looked up: the nearest `beplus.estate.json` at or above this directory, exactly as `be auto` finds it. Relative to the workspace. |
 
@@ -96,15 +96,17 @@ fork's pull request — fails nothing here: `npm view` prints nothing and exits 
 and pnpm fails minutes later with `ERR_PNPM_TARBALL_INTEGRITY`, then
 `ERR_PNPM_NO_VERSIONS`.
 
-`BE_NPM_CHECK` closes that gap. After the auth, it asks the registry for every
-`@beplus` dependency of the packages you name (`dependencies`,
-`devDependencies`, `optionalDependencies`; `workspace:` ones are skipped, and an
-npm alias such as `"@beplus/docs-legacy": "npm:@beplus/docs@0.4.2"` is asked for
-as the package after `npm:`) —
+`BE_NPM_CHECK` closes that gap. After the auth, it asks the registry for ONE
+`@beplus` dependency of the packages you name (the first, sorted, of
+`dependencies`, `devDependencies`, `optionalDependencies`; `workspace:` ones are
+skipped, and an npm alias such as `"@beplus/docs-legacy": "npm:@beplus/docs@0.4.2"`
+is asked for as the package after `npm:`) —
 through the registry Rush hands pnpm (`common/config/rush/.npmrc`), else npm's
-own — and fails the step unless each comes back as a real package, naming the
-cause: the stub (no token, or a refused one), or npm's own error (a 404 for a
-package that is not published).
+own — and fails the step unless it comes back as a real package, naming the
+cause: the stub (no token, or a refused one), or npm's own error. One request
+is enough, because the stub answers every package alike; a dependency that is
+simply not published is left to the install to report (until 2.17.0 it asked
+for every dependency, a request apiece: about a minute in a large app).
 
 ```yaml
 - uses: actions/setup-node@v6

@@ -229,6 +229,14 @@ runs:
           echo "Nothing in @beplus to check ($CHECK)."
           exit 0
         fi
+        # ONE package proves what this step is for: the token reached the job and the
+        # registry took it (the stub answers every package alike). Asking for each
+        # dependency cost a request apiece (71 in bepluscloud's console: a minute of
+        # every run), and a package that is not published is the install's to report.
+        if [ "${#wanted[@]}" -gt 1 ]; then
+          echo "Probing the registry with ${wanted[0]} (one of ${#wanted[@]} @beplus dependencies)."
+          wanted=("${wanted[0]}")
+        fi
 
         failed=0
         for pkg in "${wanted[@]}"; do

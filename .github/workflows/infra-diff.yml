@@ -62,6 +62,24 @@ name: infra diff
 
 on:
   workflow_call:
+    inputs:
+      pr-gate:
+        description: >-
+          The PR gate (pr-gate/, PR-GATE.md): a draft diffs nothing, and only the top PR of
+          a stack diffs (cdk diff compares its tree, which holds every PR below it, with
+          what is deployed), and only when the stack changes one of `gate-paths`. Off, or
+          on without `gate-paths`: every ready PR the caller's triggers start diffs.
+          Turn it on together with, in the caller: `types: [opened, synchronize,
+          reopened, ready_for_review]`, and its `paths:` filter moved into `gate-paths`
+          (a filter on the caller sees only the top PR's own commits).
+        required: false
+        type: boolean
+        default: false
+      gate-paths:
+        description: "With `pr-gate`: globs, one per line (`*` crosses `/`): what the diff reads."
+        required: false
+        type: string
+        default: ""
     secrets:
       BE_NPM_TOKEN:
         description: >-
@@ -87,6 +105,7 @@ jobs:
       packages: ${{ steps.plan.outputs.packages }}
       region: ${{ steps.estate.outputs.region }}
       marker: ${{ steps.estate.outputs.marker }}
+      run: ${{ steps.gate.outputs.run || 'true' }}
     steps:
       - uses: actions/checkout@v4
       # `beplus infra` reads beplus.estate.json and nothing
@@ -140,9 +159,21 @@ jobs:
           echo "region=$region" >> "$GITHUB_OUTPUT"
           echo "marker=$marker" >> "$GITHUB_OUTPUT"
 
+      # Last in `plan`: with `gate-paths` it checks out the PR's head with its history.
+      # Without `gate-paths` a stack's lower PR still diffs: the caller's own `paths:`
+      # filter may have started only it.
+      - name: PR gate
+        id: gate
+        if: inputs.pr-gate
+        uses: beplus/setup-beplus/pr-gate@v2
+        with:
+          stack: ${{ inputs.gate-paths != '' && 'top-only' || 'every' }}
+          paths: ${{ inputs.gate-paths }}
+
   diff:
     name: ${{ matrix.package }} · ${{ matrix.env }}
     needs: plan
+    if: needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest
     # Claiming the environment is how the job reaches BE_NPM_TOKEN, which is an
     # environment secret. On GitHub Free it adds no gate; with Environment
@@ -176,7 +207,7 @@ jobs:
   comment:
     name: comment
     needs: [plan, diff]
-    if: always() && github.event_name == 'pull_request'
+    if: always() && github.event_name == 'pull_request' && needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

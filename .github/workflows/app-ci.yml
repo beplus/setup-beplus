@@ -126,6 +126,26 @@ on:
         required: false
         type: number
         default: 40
+      pr-gate:
+        description: >-
+          The PR gate (pr-gate/, PR-GATE.md): a draft runs nothing, only the top PR of a
+          stack runs (its tree holds the PRs below), and only when the stack impacts
+          `project` (Rush's --impacted-by, from where the stack left its root branch) or
+          changes one of `gate-paths`. A skipped `checks` job reports "skipped". Off:
+          every run runs, as before. Turn it on together with, in the caller:
+          `types: [opened, synchronize, reopened, ready_for_review]`, no `paths:` filter
+          (pass them as `gate-paths`), and `pull-requests: read`.
+        required: false
+        type: boolean
+        default: false
+      gate-paths:
+        description: >-
+          With `pr-gate`: globs, one per line (`*` crosses `/`), that run the checks
+          INSTEAD of the project's Rush impact — for a check that reads a few files
+          only (an i18n coverage check). Empty: `project`'s impact decides.
+        required: false
+        type: string
+        default: ""
     secrets:
       BE_NPM_TOKEN:
         description: >-
@@ -133,9 +153,10 @@ on:
           an environment secret, `github-environment`) is all a caller passes.
         required: false
 
-permissions:
-  contents: read
-
+# No workflow-wide `permissions`: `plan` takes the caller's token as it is, so the PR gate
+# reads the repository's pull requests where the caller grants `pull-requests: read` (and
+# fails open, with a warning, where it does not). A called workflow cannot ask for more than
+# its caller grants — asking would fail every caller that does not — so it never names it.
 jobs:
   # What a caller would otherwise write out, read from the files that already
   # hold it. Every value comes from the pull request's own tree, so each is
@@ -146,6 +167,7 @@ jobs:
     outputs:
       directory: ${{ steps.project.outputs.directory }}
       database: ${{ steps.project.outputs.database }}
+      run: ${{ steps.gate.outputs.run || 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -231,10 +253,26 @@ jobs:
             echo "database=$database"
           } >> "$GITHUB_OUTPUT"
 
+      # Last in `plan`: with a project to weigh it checks out the PR's head with its whole
+      # history (blobless), which the steps above must not read.
+      - name: PR gate
+        id: gate
+        if: inputs.pr-gate
+        uses: beplus/setup-beplus/pr-gate@v2
+        with:
+          stack: top-only
+          projects: ${{ inputs.gate-paths == '' && inputs.project || '' }}
+          paths: ${{ inputs.gate-paths }}
+          node-version: ${{ inputs.node-version }}
+
   checks:
     name: checks
     needs: plan
+    # The PR gate's answer; without it, always. Skipped reports "skipped", never pending.
+    if: needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     # Where BE_NPM_TOKEN is an environment secret the job has to claim the
     # environment to see it, and the environment's branch policy must then admit
     # every branch the caller runs on. Empty: no environment.
@@ -268,8 +306,14 @@ jobs:
 
       # Keyed by the project too: `install --to` installs a subset, and
       # db-migrations-pr.yml saves its own, smaller one under the plain key.
-      - name: Cache Rush and pnpm
-        uses: actions/cache@v4
+      #
+      # RESTORED here, SAVED only off a pull request. A cache a PR saves is scoped to that
+      # PR's ref: no other PR can read it, so saving it (~40 s) bought nothing but the next
+      # push of the same PR. rush-cache.yml saves the one every PR reads, from the default
+      # branch (its key is this one).
+      - name: Restore the Rush and pnpm cache
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             common/temp
@@ -293,14 +337,23 @@ jobs:
           # ⚠️ AND PROVE IT WORKED. npm.beplus.cloud answers a read it cannot
           # authenticate with HTTP 200 and a stub body, never 401, so a token
           # that did not reach this job fails nothing until pnpm, minutes later.
-          # This asks the registry for every @beplus package the project depends
-          # on, and fails here, naming the cause.
+          # This asks the registry for ONE @beplus package the project depends on
+          # (one request, about a second) and fails here, naming the cause. A
+          # package that is not published is the install's to report.
           BE_NPM_CHECK: ${{ needs.plan.outputs.directory }}
 
       - name: Rush install
         env:
           PROJECT: ${{ inputs.project }}
         run: node common/scripts/install-run-rush.js install --to "$PROJECT"
+
+      - name: Save the Rush and pnpm cache
+        if: github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Rush build
         if: inputs.build != 'none'

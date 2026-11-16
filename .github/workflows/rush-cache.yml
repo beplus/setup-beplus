@@ -1,0 +1,135 @@
+# The Rush and pnpm cache every pull request reads.
+# --------------------------------------------------
+# A cache is scoped to the ref that saved it. A pull request reads its own, its base
+# branch's and the DEFAULT branch's — never another PR's. So the caches app-ci.yml,
+# library-ci.yml and db-migrations-pr.yml used to save from a pull request (~40 s each)
+# served only that PR's next push; they now only restore on a pull request, and this
+# saves the one they all read:
+#
+#   - from the DEFAULT branch, because a stack's upper PRs are based on the PR below
+#     them and read only their base's caches and the default branch's. In a repository
+#     whose default branch is `main` while work lands on `dev` (bepluscloud/ai,
+#     Mountaineer), run it on a schedule, which runs on the default branch, and name
+#     `ref: dev`: it installs dev's lockfile and saves it in the default branch's scope.
+#   - under the key the checks restore: with `project`, app-ci.yml's
+#     (`<os>-<arch>-rush-<project>-<hash>`, `rush install --to <project>`); without,
+#     the plain one db-migrations-pr.yml and library-ci.yml use (`<os>-<arch>-rush-<hash>`,
+#     a full `rush install`).
+#
+# A run whose key is already saved does nothing but look (a few seconds). A PR that
+# changes the lockfile restores the nearest older cache by prefix, and pnpm fetches the
+# difference.
+#
+#   on:
+#     schedule:
+#       - cron: "40 4 * * *"
+#     workflow_dispatch:
+#   jobs:
+#     console:
+#       uses: beplus/setup-beplus/.github/workflows/rush-cache.yml@v2
+#       with:
+#         ref: dev
+#         project: "@bepluscloud/console"
+#         github-environment: dev
+#       secrets: inherit
+
+name: Rush cache
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "The branch whose lockfile is installed. Default: the ref the caller runs on."
+        required: false
+        type: string
+        default: ""
+      project:
+        description: >-
+          The Rush project app-ci.yml checks: install `--to` it and save under app-ci's key.
+          Empty: a full `rush install` under the plain key.
+        required: false
+        type: string
+        default: ""
+      node-version:
+        description: "Node.js version."
+        required: false
+        type: string
+        default: "22.14"
+      github-environment:
+        description: "The environment that holds BE_NPM_TOKEN, where it is an environment secret."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      BE_NPM_TOKEN:
+        description: "npm.beplus.cloud token for the @beplus scope."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  save:
+    name: save ${{ inputs.project || 'rush' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github-environment }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Is it saved already
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ runner.os }}-${{ runner.arch }}-rush-${{ inputs.project && format('{0}-', inputs.project) || '' }}${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
+          lookup-only: true
+
+      - name: Authenticate the @beplus scope
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_CLI_VERSION: ${{ vars.BE_CLI_VERSION }}
+          BE_NPM_AUTH: true
+
+      - name: Rush install
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PROJECT" ]; then
+            node common/scripts/install-run-rush.js install --to "$PROJECT"
+          else
+            node common/scripts/install-run-rush.js install
+          fi
+
+      - name: Save the cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Say what it did
+        env:
+          HIT: ${{ steps.cache.outputs.cache-hit }}
+          KEY: ${{ steps.cache.outputs.cache-primary-key }}
+        run: |
+          if [ "$HIT" = true ]; then
+            echo "### Rush cache: already saved" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Rush cache: saved" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "\`$KEY\` in ${GITHUB_REF}'s scope." >> "$GITHUB_STEP_SUMMARY"

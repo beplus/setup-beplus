@@ -1,0 +1,233 @@
+name: "beplus PR gate"
+description: >-
+  Decides whether a pull request's checks run: never on a draft; in a stack, only on the
+  top PR (its tree holds every change below it); and, given projects or paths, only when
+  the stack changes one of them. Every other event runs. One mechanism for every beplus
+  estate's workflows (app-ci, library-ci, docs-pages, db-migrations-pr, infra-diff, and a
+  repository's own).
+
+# Why (pr-gate/PR-GATE.md has the whole of it):
+#
+#   1. A draft runs nothing. Agents open drafts, test locally, link a stack, then mark the
+#      PRs ready.
+#   2. Only the top PR of a stack runs. Its head holds every change of the PRs below it,
+#      and a stack merges in one go (`gh stack merge`), so dev ends at the top's tree. A
+#      PR "below" is one another open PR is based on. A PR that leaves the stack has
+#      nothing above it, so its next run is its own.
+#   3. Only what the stack changes. With `projects`, Rush's own `--impacted-by` over the
+#      stack's whole diff (from where it left its root branch, never from the PR's own
+#      base, which for the top of a stack is the PR below) says whether any of them is
+#      impacted — through its dependencies and the lockfile, as Rush computes it. With
+#      `paths`, a changed file matching one of them. Files in `always` run everything.
+#
+# It fails open: if GitHub cannot be asked (no `pull-requests: read`), or Rush cannot
+# answer, the checks run, with a warning saying why.
+#
+# A job skipped by `if:` reports "skipped", which a required check accepts; a workflow a
+# `paths:` filter left out reports nothing. So filter here, never with `on.*.paths`.
+
+inputs:
+  stack:
+    description: >-
+      `top-only` (the default): a PR another open PR is based on skips; the top PR's run
+      covers it. `every`: every ready PR runs.
+    required: false
+    default: top-only
+  projects:
+    description: >-
+      Rush projects, space- or newline-separated. Run only when the stack impacts one of
+      them (`rush list --impacted-by git:<fork point>`). Empty: no project test.
+    required: false
+    default: ""
+  paths:
+    description: >-
+      Globs, one per line (bash patterns; `*` crosses `/`). Run when a changed file
+      matches one. With `projects` too, either one is enough. Empty: no path test.
+    required: false
+    default: ""
+  always:
+    description: >-
+      Globs that run the checks whatever else changed: what every project's build reads.
+      Only consulted when `projects` or `paths` is set.
+    required: false
+    default: |
+      .github/workflows/*
+      .github/actions/*
+      rush.json
+      package.json
+      beplus.estate.json
+      common/config/rush/*.json
+      common/config/rush/.npmrc*
+      common/scripts/*
+  node-version:
+    description: "Node.js for Rush, with `projects` (rush.json's nodeSupportedVersionRange holds it)."
+    required: false
+    default: "22.14"
+  github-token:
+    description: "A token that reads the repository's pull requests (`pull-requests: read`)."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  run:
+    description: "`true` when the checks should run, `false` when they skip."
+    value: ${{ steps.decide.outputs.run }}
+  reason:
+    description: "Why, in a sentence."
+    value: ${{ steps.decide.outputs.reason }}
+  root:
+    description: "The branch the stack leaves from (`dev`, `main`, `_versions/…`), on a pull request."
+    value: ${{ steps.stack.outputs.root }}
+
+runs:
+  using: composite
+  steps:
+    # Draft, the stack's top, and the stack's root: GitHub's answers alone, no checkout.
+    - name: Where this PR stands in its stack
+      id: stack
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        EVENT: ${{ github.event_name }}
+        REPO: ${{ github.repository }}
+        OWNER: ${{ github.repository_owner }}
+        DRAFT: ${{ github.event.pull_request.draft }}
+        NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        STACK: ${{ inputs.stack }}
+      run: |
+        set -uo pipefail
+        out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+
+        if [[ "$EVENT" != pull_request && "$EVENT" != pull_request_target ]]; then
+          out decided true; out run true; out reason "Not a pull request ($EVENT): it runs."
+          exit 0
+        fi
+        if [[ "$DRAFT" == true ]]; then
+          out decided true; out run false
+          out reason "#$NUMBER is a draft: nothing runs until it is marked ready."
+          exit 0
+        fi
+        case "$STACK" in top-only | every) ;; *)
+          echo "::error::the \`stack\` input: \"$STACK\" is not top-only or every."; exit 1 ;;
+        esac
+
+        # A fork's branch is never another PR's base here.
+        if [[ "$STACK" == top-only && "$HEAD_REPO" == "$REPO" ]]; then
+          above="$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base="$HEAD_REF" -f per_page=20 \
+            --jq '[.[] | select(.head.repo.full_name == "'"$REPO"'") | .number] | map(tostring) | join(", #")' 2>/tmp/pr-gate.err)"
+          if [[ $? -ne 0 ]]; then
+            echo "::warning title=PR gate::Could not list the PRs above #$NUMBER ($(head -c 200 /tmp/pr-gate.err)); the checks run. Give the workflow \`pull-requests: read\`."
+          elif [[ -n "$above" ]]; then
+            out decided true; out run false
+            out reason "#$above is based on #$NUMBER's branch (above it in its stack), and the top PR's run covers this one."
+            exit 0
+          fi
+        fi
+
+        # The stack's root: follow each base down while an open PR has it as its head.
+        root="$BASE_REF"
+        for _ in $(seq 1 20); do
+          below="$(gh api -X GET "repos/$REPO/pulls" -f state=open -f head="$OWNER:$root" -f per_page=1 --jq '.[0].base.ref // empty' 2>/dev/null)" || break
+          [[ -n "$below" && "$below" != "$root" ]] || break
+          root="$below"
+        done
+        out root "$root"
+        out decided false
+
+    # What the stack changes, from where it left its root, by git and Rush.
+    - name: Fetch the stack's history
+      if: steps.stack.outputs.decided == 'false' && (inputs.projects != '' || inputs.paths != '')
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0
+        filter: blob:none
+        persist-credentials: false
+
+    - name: Node for Rush
+      if: steps.stack.outputs.decided == 'false' && inputs.projects != ''
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Decide
+      id: decide
+      shell: bash
+      env:
+        DECIDED: ${{ steps.stack.outputs.decided }}
+        RUN: ${{ steps.stack.outputs.run }}
+        REASON: ${{ steps.stack.outputs.reason }}
+        ROOT: ${{ steps.stack.outputs.root }}
+        NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PROJECTS: ${{ inputs.projects }}
+        PATHS: ${{ inputs.paths }}
+        ALWAYS: ${{ inputs.always }}
+      run: |
+        set -uo pipefail
+        decide() {
+          echo "run=$1" >> "$GITHUB_OUTPUT"
+          echo "reason=$2" >> "$GITHUB_OUTPUT"
+          if [[ "$1" == true ]]; then echo "▶ $2"; else echo "⏭ $2"; fi
+          { echo "### PR gate: $([[ "$1" == true ]] && echo runs || echo skipped)"; echo; echo "$2"; } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        }
+        [[ "$DECIDED" == true ]] && decide "$RUN" "$REASON"
+        if [[ -z "$PROJECTS" && -z "$PATHS" ]]; then
+          decide true "#$NUMBER is the top of its stack (or alone): it runs."
+        fi
+
+        if ! git fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$ROOT:refs/remotes/origin/$ROOT"; then
+          echo "::warning title=PR gate::Could not fetch $ROOT; the checks run."
+          decide true "#$NUMBER: its root branch $ROOT could not be fetched, so it runs."
+        fi
+        fork="$(git merge-base "$HEAD_SHA" "origin/$ROOT")" || decide true "#$NUMBER shares no history with $ROOT, so it runs."
+        mapfile -t changed < <(git diff --name-only "$fork" "$HEAD_SHA")
+        echo "The stack changes ${#changed[@]} file(s) since it left $ROOT at ${fork:0:8}."
+
+        # Globs, one per line; `*` crosses `/` in [[ == ]].
+        matches() {
+          local list="$1" f g
+          for f in "${changed[@]}"; do
+            while IFS= read -r g || [[ -n "$g" ]]; do
+              g="${g#"${g%%[![:space:]]*}"}"; g="${g%"${g##*[![:space:]]}"}"
+              [[ -n "$g" && "${g:0:1}" != "#" ]] || continue
+              # shellcheck disable=SC2053
+              if [[ "$f" == $g ]]; then echo "$f"; return 0; fi
+            done <<< "$list"
+          done
+          return 1
+        }
+        if hit="$(matches "$ALWAYS")"; then
+          decide true "#$NUMBER changes $hit, which every check reads: it runs."
+        fi
+        if [[ -n "$PATHS" ]] && hit="$(matches "$PATHS")"; then
+          decide true "#$NUMBER changes $hit: it runs."
+        fi
+
+        if [[ -n "$PROJECTS" ]]; then
+          if [[ ! -f rush.json ]]; then
+            echo "::warning title=PR gate::\`projects\` names Rush projects, but there is no rush.json; the checks run."
+            decide true "#$NUMBER: no rush.json to read the projects from, so it runs."
+          fi
+          json="$(node common/scripts/install-run-rush.js list --impacted-by "git:$fork" --json 2>/tmp/pr-gate.err | sed -n '/^{/,$p')"
+          impacted="$(printf '%s' "$json" | node -e '
+            let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+              try { process.stdout.write(JSON.parse(s).projects.map((p) => p.name).join(" ")); }
+              catch { process.exit(1); }
+            });')" || {
+            echo "::warning title=PR gate::rush list --impacted-by failed ($(tail -c 300 /tmp/pr-gate.err)); the checks run."
+            decide true "#$NUMBER: Rush could not say what it impacts, so it runs."
+          }
+          echo "Impacted: ${impacted:-nothing}."
+          for p in $PROJECTS; do
+            for i in $impacted; do
+              [[ "$p" == "$i" ]] && decide true "#$NUMBER's stack impacts $p: it runs."
+            done
+          done
+          decide false "#$NUMBER's stack impacts none of $(echo $PROJECTS) (it impacts ${impacted:-nothing}): skipped."
+        fi
+        decide false "#$NUMBER's stack changes none of the paths this check reads: skipped."
