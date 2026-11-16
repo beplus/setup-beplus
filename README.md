@@ -24,6 +24,20 @@ Configures Git for secure operations using a GitHub App token.
 ```yaml
 - uses: beplus/setup-beplus/git@v2
 ```
+
+### [`pr-gate`](./pr-gate/PR-GATE.md)
+Decides whether a pull request's checks run: never on a draft, only on the top PR
+of a stack (its tree holds every PR below it), and only when the stack impacts the
+Rush projects (or changes the paths) the check reads. Every reusable workflow below
+takes it as `pr-gate: true`, off by default. See [PR-GATE.md](./pr-gate/PR-GATE.md).
+
+```yaml
+- id: gate
+  uses: beplus/setup-beplus/pr-gate@v2
+  with:
+    projects: "@bepluscloud/console"
+```
+
 ### Reusable workflows
 
 The thirteen `beplus/*` library repositories each carried a copy of the same PR

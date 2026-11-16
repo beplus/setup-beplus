@@ -69,6 +69,17 @@ on:
         required: false
         type: boolean
         default: false
+      pr-gate:
+        description: >-
+          The PR gate (pr-gate/, PR-GATE.md): a draft runs nothing, and only the top PR
+          of a stack runs (its tree holds every PR below it), claiming the environment of
+          the branch the stack leaves from (dev) rather than its own base. Off: every run
+          runs, as before. Turn it on together with, in the caller:
+          `types: [opened, synchronize, reopened, ready_for_review]` and no `branches:`
+          filter (a stack's top PR is based on the PR below it, never on dev).
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -79,11 +90,29 @@ env:
   AWS_REGION: us-east-1
 
 jobs:
+  gate:
+    name: PR gate
+    if: inputs.pr-gate
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+      root: ${{ steps.gate.outputs.root }}
+    steps:
+      - id: gate
+        uses: beplus/setup-beplus/pr-gate@v2
+        with:
+          stack: top-only
+
   validate:
     name: Validate Changes
+    needs: gate
+    # Without the gate (skipped), always; with it, its answer.
+    if: ${{ !cancelled() && (needs.gate.result == 'skipped' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-latest
 
-    environment: ${{ github.base_ref }}
+    # The environment of the branch the stack leaves from: a stack's top PR is based on
+    # the PR below it, whose branch is no environment.
+    environment: ${{ needs.gate.outputs.root || github.base_ref }}
 
     env:
       BE_ENVIRONMENT: ${{ vars.BE_ENVIRONMENT }}
@@ -107,15 +136,19 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
 
-      - name: Cache Rush and pnpm
+      # Restored on every run, saved only off a pull request: a PR's cache is scoped to its
+      # own ref, so no other PR reads it (rush-cache.yml saves the one they all read).
+      - name: Restore the Rush and pnpm cache
         if: inputs.cache
-        uses: actions/cache@v4
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             common/temp
-          key: ${{ runner.os }}-rush-${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
+          # rush-cache.yml's plain key (until 2.17.0 it had no arch: one miss, then the same).
+          key: ${{ runner.os }}-${{ runner.arch }}-rush-${{ hashFiles('common/config/rush/pnpm-lock.yaml', 'rush.json') }}
           restore-keys: |
-            ${{ runner.os }}-rush-
+            ${{ runner.os }}-${{ runner.arch }}-rush-
 
       - uses: beplus/setup-beplus/cli@v2
         env:
@@ -128,6 +161,14 @@ jobs:
       - name: Install the Dependencies
         run: node ./common/scripts/install-run-rush.js install
 
+      - name: Save the Rush and pnpm cache
+        if: inputs.cache && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
       - name: Check for package changes
         if: inputs.change-file-check
         id: package-changes
@@ -136,7 +177,8 @@ jobs:
           HAS_CHANGE_FILES=false
 
           # Check for changes in packages directory
-          if git diff origin/${{ github.base_ref }}...HEAD --name-only | grep -q "^packages/"; then
+          # From the stack's root (the gate's), so a stack's top PR sees every PR below it.
+          if git diff origin/${{ needs.gate.outputs.root || github.base_ref }}...HEAD --name-only | grep -q "^packages/"; then
             HAS_PACKAGE_CHANGES=true
             echo "📦 Package code changes detected"
           fi

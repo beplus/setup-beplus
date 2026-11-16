@@ -110,7 +110,8 @@ const libraries = (ORG) => {
    * anything else leaves it in, with its own runtime condition intact.
    */
   const enabledSteps = (workflow, withInputs) => {
-    const job = Object.values(workflow.jobs)[0];
+    // The work's job, not the PR gate's (`gate`, pr-gate/PR-GATE.md), which only decides.
+    const job = Object.entries(workflow.jobs).find(([name]) => name !== 'gate')[1];
     return job.steps
       .filter((step) => {
         const named = [...String(step.if ?? '').matchAll(/inputs\.([a-z-]+)/g)].map((m) => m[1]);

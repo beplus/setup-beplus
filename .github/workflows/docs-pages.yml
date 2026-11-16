@@ -120,9 +120,28 @@ on:
         required: false
         type: string
         default: ""
+      pr-gate:
+        description: >-
+          The PR gate (pr-gate/, PR-GATE.md) for a pull request's build: a draft builds
+          nothing, and only the top PR of a stack builds (its tree holds every PR below it).
+          A push builds and publishes as before. Off: every pull request builds. Turn it on
+          together with, in the caller: `types: [opened, synchronize, reopened,
+          ready_for_review]`, no `branches:`/`paths:` filter on `pull_request` (pass the
+          paths as `gate-paths`), and `pull-requests: read`.
+        required: false
+        type: boolean
+        default: false
+      gate-paths:
+        description: >-
+          With `pr-gate`: globs, one per line (`*` crosses `/`): a pull request builds only
+          when its stack changes one (the workflows, rush.json and the like always count).
+          Empty: every ready top PR builds.
+        required: false
+        type: string
+        default: ""
 
-permissions:
-  contents: read
+# No workflow-wide `permissions`: every job names its own, and `gate` takes the caller's
+# token as it is (a called workflow asking for more than its caller grants fails them all).
 
 # One deployment at a time, and never cancel one half-done: a partly uploaded site is a broken one.
 # A pull request's build deploys nothing, so a newer push to it replaces the one in flight.
@@ -131,8 +150,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  gate:
+    name: PR gate
+    if: inputs.pr-gate && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - id: gate
+        uses: beplus/setup-beplus/pr-gate@v2
+        with:
+          stack: top-only
+          paths: ${{ inputs.gate-paths }}
+
   build:
     name: Build the docs site
+    needs: gate
+    # Without the gate (off, or not a pull request), always; with it, its answer.
+    if: ${{ !cancelled() && (needs.gate.result == 'skipped' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     # `pages: read` is for asking Pages where the site will be served, below.
@@ -349,7 +384,10 @@ jobs:
   deploy:
     name: Publish to GitHub Pages
     needs: build
-    if: needs.build.outputs.publish == 'true'
+    # ⚠️ Status spelled out: `gate`, above `build`, is skipped on every push, and an implicit
+    # success() counts a skipped job anywhere up the chain as not succeeded — so without
+    # `!cancelled()` here nothing would ever publish.
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.build.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     # Pages needs to write the deployment and to mint the token that proves it came from this run.
     permissions:
@@ -366,7 +404,8 @@ jobs:
   package:
     name: Publish the docs package
     needs: build
-    if: needs.build.outputs.publish == 'true' && inputs.package
+    # Status spelled out, as for `deploy`.
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.build.outputs.publish == 'true' && inputs.package }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.package-environment }}
     # The site is already up: a package that cannot be published fails here, never the deploy.

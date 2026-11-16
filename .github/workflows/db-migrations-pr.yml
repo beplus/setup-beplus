@@ -83,6 +83,28 @@ on:
         required: false
         type: string
         default: ""
+      pr-gate:
+        description: >-
+          The PR gate (pr-gate/, PR-GATE.md): a draft checks nothing, and only the top PR
+          of a stack checks (its tree holds every PR below it), and only when the stack
+          impacts the database project (Rush's --impacted-by, from where the stack left its
+          root branch) or changes one of `gate-paths`. Off: every run the caller's
+          triggers start runs, as before. Turn it on together with, in the caller:
+          `types: [opened, synchronize, reopened, ready_for_review]` on `pull_request`,
+          NO `paths:` filter there (it sees only the top PR's own commits; a `push`
+          filter may stay), and `pull-requests: read`.
+        required: false
+        type: boolean
+        default: false
+      gate-paths:
+        description: >-
+          With `pr-gate`: globs, one per line (`*` crosses `/`), that run the checks
+          INSTEAD of the database project's Rush impact — the paths a caller's
+          `paths:` filter named (beplus.estate.json and the workflows always run them).
+          Empty: the database project's impact decides.
+        required: false
+        type: string
+        default: ""
     secrets:
       BE_NPM_TOKEN:
         description: >-
@@ -90,9 +112,9 @@ on:
           an environment secret, `github-environment`) is all a caller passes.
         required: false
 
-permissions:
-  contents: read
-
+# No workflow-wide `permissions`: `plan` takes the caller's token as it is, so the PR gate
+# reads pull requests where the caller grants `pull-requests: read` (a called workflow
+# asking for more than its caller grants would fail every caller that does not).
 jobs:
   # What the copies wrote out by hand, read from the manifest that already
   # holds it. Both values come from the pull request's own tree, so both are
@@ -104,6 +126,7 @@ jobs:
       package: ${{ steps.database.outputs.package }}
       project: ${{ steps.database.outputs.project }}
       database: ${{ steps.database.outputs.database }}
+      run: ${{ steps.gate.outputs.run || 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -155,10 +178,25 @@ jobs:
             echo "database=$database"
           } >> "$GITHUB_OUTPUT"
 
+      # Last in `plan`: it checks out the PR's head with its history.
+      - name: PR gate
+        id: gate
+        if: inputs.pr-gate
+        uses: beplus/setup-beplus/pr-gate@v2
+        with:
+          stack: top-only
+          projects: ${{ inputs.gate-paths == '' && steps.database.outputs.project || '' }}
+          paths: |
+            beplus.estate.json
+            ${{ inputs.gate-paths }}
+
   checks:
     name: migration integrity + rebuild
     needs: plan
+    if: needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     # Where BE_NPM_TOKEN is an environment secret (MRKIT: `dev`) the job has to
     # claim the environment to see it, and the environment's branch policy must
     # then admit every branch this gate runs on — it has no `branches` filter
@@ -200,8 +238,12 @@ jobs:
         with:
           node-version: 22.14
 
-      - name: Cache Rush and pnpm
-        uses: actions/cache@v4
+      # Restored on every run, saved only off a pull request (the push to dev this
+      # workflow also runs on): a PR's cache is scoped to its own ref, and no other PR
+      # can read it.
+      - name: Restore the Rush and pnpm cache
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             common/temp
@@ -225,12 +267,20 @@ jobs:
           # authenticate with HTTP 200 and a stub body, never 401, so a token
           # that did not reach this job fails nothing until pnpm, minutes later,
           # reports ERR_PNPM_TARBALL_INTEGRITY, then ERR_PNPM_NO_VERSIONS. This
-          # asks the registry for every @beplus package the database package
-          # depends on, and fails here, naming the cause.
+          # asks the registry for ONE @beplus package the database package
+          # depends on (one request), and fails here, naming the cause.
           BE_NPM_CHECK: ${{ needs.plan.outputs.package }}
 
       - name: Rush install
         run: node common/scripts/install-run-rush.js install --to ${{ needs.plan.outputs.project }}
+
+      - name: Save the Rush and pnpm cache
+        if: github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            common/temp
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       # ⚠️ INSTALL IS NOT ENOUGH. drizzle-kit reads dist/, including workspace
       # dependencies' — Mountaineer's @beplus/postmark contributes tables.

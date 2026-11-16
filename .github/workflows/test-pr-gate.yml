@@ -1,0 +1,29 @@
+# The PR gate's decisions (pr-gate/action.yml), against a fake `gh` and a throwaway git
+# repository: drafts, a stack's bottom, middle and top, a lone PR, a fork, a push, paths,
+# `always`, and the answers that fail open. See test/pr-gate/run.sh.
+name: Test pr-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - pr-gate/**
+      - test/pr-gate/**
+      - .github/workflows/test-pr-gate.yml
+  push:
+    branches: [main]
+    paths:
+      - pr-gate/**
+      - test/pr-gate/**
+      - .github/workflows/test-pr-gate.yml
+
+permissions:
+  contents: read
+
+jobs:
+  decisions:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test/pr-gate/run.sh
