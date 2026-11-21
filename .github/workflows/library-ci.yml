@@ -69,6 +69,18 @@ on:
         required: false
         type: boolean
         default: false
+      tests:
+        description: >-
+          Run the repository's bulk `test` command (`rush test --verbose`) after the
+          build. Off by default: every library that had a bulk `test` when this was
+          added (actions, ai, i18n, kb, mind, flows, …) already runs it in a `test` job
+          of its own, several against a Postgres or Neo4j service this job does not
+          start, so turning it on for them would run their suites twice, or without
+          their database. On, with no bulk `test` in command-line.json, the step says
+          so and skips.
+        required: false
+        type: boolean
+        default: false
       pr-gate:
         description: >-
           The PR gate (pr-gate/, PR-GATE.md): a draft runs nothing, and only the top PR
@@ -210,11 +222,39 @@ jobs:
       - name: Build packages
         run: node ./common/scripts/install-run-rush.js rebuild --verbose
 
+      # Always present, so a caller's enabled steps stay those of the file it replaced
+      # (scripts/verify-callers.mjs); `tests` decides inside. Over every project, as the
+      # build above is: this job's gate selects no projects, so there is no impacted set.
       - name: Run tests (when available)
+        env:
+          BE_TESTS: ${{ inputs.tests }}
         run: |
-          # Add this when you have tests
-          # node ./common/scripts/install-run-rush.js test --verbose
-          echo "Tests will be added in the future"
+          if [ "$BE_TESTS" != "true" ]; then
+            echo "Tests are off for this repository (library-ci.yml's \`tests\` input); its own workflow runs them, or none does."
+            exit 0
+          fi
+
+          # Is there a bulk `test` command? command-line.json is JSONC, read as the version
+          # policy check below reads rush.json.
+          TEST_KIND=$(node -e "
+            const fs = require('fs');
+            const file = 'common/config/rush/command-line.json';
+            if (!fs.existsSync(file)) { console.log('none'); process.exit(0); }
+            const keepStrings = (match) => (match[0] === '\x22' ? match : '');
+            const text = fs.readFileSync(file, 'utf8')
+              .replace(/\x22(?:[^\x22\x5c]|\x5c.)*\x22|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, keepStrings)
+              .replace(/\x22(?:[^\x22\x5c]|\x5c.)*\x22|,(?=\s*[}\]])/g, keepStrings);
+            const test = (JSON.parse(text).commands || []).find((c) => c.name === 'test');
+            console.log(test ? test.commandKind : 'none');
+          ")
+
+          if [ "$TEST_KIND" != "bulk" ]; then
+            echo "::notice title=No tests run::\`tests: true\`, but common/config/rush/command-line.json defines no bulk \`test\` command (found: $TEST_KIND). Add one, with a \`test\` script in each project that has tests."
+            echo "⚠️ \`tests: true\`, but there is no bulk \`test\` command in \`common/config/rush/command-line.json\`: no tests ran." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          node ./common/scripts/install-run-rush.js test --verbose
 
       - name: Check bundle size
         if: inputs.bundle-size-check
