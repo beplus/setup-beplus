@@ -76,6 +76,34 @@ nothing: a repository states what it already did. `scripts/verify-callers.mjs`
 checked that, resolving each caller against the shared workflow and comparing the
 enabled steps to the file it replaced.
 
+#### Tests in library-ci
+
+`library-ci.yml` builds every project (`rush rebuild`) and, with **`tests: true`**
+(since v2.18.0), runs the repository's bulk `test` command after it:
+`rush test --verbose`, over every project, as the build is (the job's PR gate
+selects no projects, so there is no impacted set to narrow to). A repository whose
+`common/config/rush/command-line.json` has no bulk `test` command gets a notice
+and a line in the job summary saying no tests ran, and the step passes. Until
+v2.18.0 the step only echoed "Tests will be added in the future", so a library
+without a `test` job of its own ran its tests on developers' machines only.
+
+It is off by default, because the libraries that already had a bulk `test` run it
+in a `test` job of their own (actions, ai, i18n, kb, mind, flows, workbench, …),
+several against a Postgres or Neo4j service that this job does not start. Turn it
+on in a library that has no such job:
+
+```yaml
+    uses: beplus/setup-beplus/.github/workflows/library-ci.yml@v2
+    with:
+      packages: |
+        packages/core/api-core
+      tests: true
+```
+
+A project without a `test` script is skipped only if the command says
+`"ignoreMissingScript": true`; give a project that needs tools the runner lacks
+(the Smithy CLI, say) no `test` script, or a separate one.
+
 #### One version per commit, built once, promoted
 
 A library publishes the way cli_v2 releases the CLI. A version is cut once, on dev,
