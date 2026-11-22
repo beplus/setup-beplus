@@ -497,7 +497,8 @@ jobs:
   `<tag-prefix><version>`, and decides which platforms build.
 - **build-mac** (on a tag) claims `environment` for its secrets and builds both
   architectures in one electron-builder run, signed and notarized through the
-  package's fastlane `build` lane (beplus/apple-signing). Then it checks the
+  package's fastlane `build` lane, from the match store `signing-repo`
+  (beplus/apple-signing by default). Then it checks the
   signature, Gatekeeper and the staple, and smoke-tests the packaged app.
 - **build-windows** (when `windows` is `unsigned` or `signed`) builds one NSIS
   installer for x64 and arm64. `signed` goes through Azure Trusted Signing
@@ -530,6 +531,7 @@ last, holding `"smoke":"ok"` and `"version":"<version>"`.
 | `tag-prefix`, `feed-url` | required | The tag without its version; the feed installed copies read |
 | `release-role`, `release-bucket`, `s3-prefix` | required | publish's role, the feed's bucket, and the key prefix the feed's path serves |
 | `environment` | required | The GitHub environment holding the build secrets (`shared`, `main`) |
+| `signing-repo` | `beplus/apple-signing` | The fastlane match store, as owner/name (MRKIT: `mrkithq/apple-signing`) |
 | `mac` | `true` | Build and publish the Mac on a tag |
 | `windows` | none | `unsigned` or `signed`; pass `vars.BE_DESKTOP_WINDOWS` |
 | `linux` | none | `on`; pass `vars.BE_DESKTOP_LINUX` |
