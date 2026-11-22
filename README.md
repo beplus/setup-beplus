@@ -454,6 +454,98 @@ jobs:
 The other inputs are docs-pages.yml's: `build`, `output`, `environment` and
 `node-version`. It needs `@beplus/docs-site >= 1.0.0-next.19` (beplus/docs#31).
 
+An estate's desktop app — an Electron shell over its deployed console
+(bepluscloud's beplus app, Mountaineer's, MRKIT's) — is released for macOS,
+Windows and Linux by **`desktop-release.yml`**. bepluscloud released all three
+from one tag; the other two carried a Mac-only copy of its first half that
+differed by names alone. Those names are the inputs (BE-281, under I-34):
+
+```yaml
+# .github/workflows/desktop-release.yml — keep your own triggers
+name: Desktop Release
+on:
+  push:
+    tags: ["mountaineer/desktop/v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+jobs:
+  release:
+    uses: beplus/setup-beplus/.github/workflows/desktop-release.yml@v2
+    with:
+      app-dir: packages/apps/desktop
+      project: "@mountaineer/desktop"
+      product: Mountaineer
+      tag-prefix: mountaineer/desktop/v
+      feed-url: https://desktop.mountaineer.im/mountaineer
+      release-role: arn:aws:iam::270953801504:role/github-actions-ironmountain-cz-monorepo-main-desktop-release
+      release-bucket: be-desktop-releases-270953801504
+      s3-prefix: mountaineer
+      environment: shared
+      windows: ${{ vars.BE_DESKTOP_WINDOWS }}
+      linux: ${{ vars.BE_DESKTOP_LINUX }}
+      npm-target: ${{ vars.BE_NPM_TARGET }}
+    secrets:
+      BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+```
+
+- **plan** reads `app-dir`'s package.json version, refuses a tag that is not
+  `<tag-prefix><version>`, and decides which platforms build.
+- **build-mac** (on a tag) claims `environment` for its secrets and builds both
+  architectures in one electron-builder run, signed and notarized through the
+  package's fastlane `build` lane (beplus/apple-signing). Then it checks the
+  signature, Gatekeeper and the staple, and smoke-tests the packaged app.
+- **build-windows** (when `windows` is `unsigned` or `signed`) builds one NSIS
+  installer for x64 and arm64. `signed` goes through Azure Trusted Signing
+  (`BE_WIN_SIGNING_*`, `AZURE_*`). `unsigned` checks that the pack names no
+  publisher, so its copies take the first signed update.
+- **build-linux** (when `linux` is `on`) builds a .deb and an AppImage for x64
+  and arm64 on ubuntu-22.04, writes `SHA256SUMS-<version>-linux.txt`, and
+  smoke-tests the AppImage and the installed .deb under Xvfb.
+- **publish** (on a tag) claims **no** environment, because the release role
+  trusts the tag's subject. It refuses a version already in the bucket, uploads
+  the installers immutable and then each platform's manifest uncached, and reads
+  the feed back.
+- **Run workflow** (any branch) packs Windows unsigned and Linux for a try,
+  keeps them as the run's artifacts `windows-try` and `linux-try`, and
+  publishes nothing.
+
+What the app must provide: `bundle exec fastlane build` for the Mac, the npm
+scripts `dist:win`, `dist:win:local` and `dist:linux`, and a packer that writes
+`BE_DESKTOP_UPDATE_URL` into app-update.yml. The file names are electron-builder's
+defaults for the Mac; `nsis.artifactName` is `<product>-Setup-${version}.${ext}`,
+`appImage.artifactName` is `<product>-${version}-${arch}.${ext}`, and
+`deb.artifactName` is `<product>_${version}_${arch}.${ext}`, which installs to
+`/opt/<product>/<executable>`. A smoke run (`BE_DESKTOP_SMOKE=1`) prints a JSON line
+last, holding `"smoke":"ok"` and `"version":"<version>"`.
+
+| Input | Default | |
+|---|---|---|
+| `app-dir`, `project`, `product` | required | The package's folder, its Rush project, electron-builder's productName (no spaces) |
+| `executable` | `product`, lower case | `linux.executableName` |
+| `tag-prefix`, `feed-url` | required | The tag without its version; the feed installed copies read |
+| `release-role`, `release-bucket`, `s3-prefix` | required | publish's role, the feed's bucket, and the key prefix the feed's path serves |
+| `environment` | required | The GitHub environment holding the build secrets (`shared`, `main`) |
+| `mac` | `true` | Build and publish the Mac on a tag |
+| `windows` | none | `unsigned` or `signed`; pass `vars.BE_DESKTOP_WINDOWS` |
+| `linux` | none | `on`; pass `vars.BE_DESKTOP_LINUX` |
+| `npm-target` | `beplus.cloud` | npm.<target>; pass `vars.BE_NPM_TARGET` |
+| `test`, `test-windows`, `test-linux` | `npm test` | The tests in `app-dir` per platform |
+| `linux-apt` | none | Extra apt packages for the Linux job |
+| `build-env` | none | `KEY=VALUE` lines for every pack and smoke run (not secrets) |
+| `smoke-match` | none | A string the smoke line must also hold (e.g. the console's origin) |
+| `node-version`, `aws-region` | `22.14`, `us-east-1` | |
+
+Secrets go **by name** (`BE_NPM_TOKEN`, `BE_GITHUB_APP_ID`,
+`BE_GITHUB_APP_PRIVATE_KEY`, `BE_APPSTORE_CONNECT_KEY_*`,
+`BE_FASTLANE_MATCH_PASSWORD`, `AZURE_*`), because GitHub passes `inherit` only to a
+workflow of the same organization or enterprise. A secret in `environment` is
+read by the jobs that claim it and needs no passing.
+
 ---
 
 ## Quick Start
