@@ -24,6 +24,16 @@ inputs:
       no check.
     required: false
     default: ""
+  BE_PLUGINS:
+    description: >-
+      beplus CLI plugins to install after the CLI, each `<package>@<exact version>`
+      (e.g. @beplus/cli-plugin-electron@0.1.0), space- or newline-separated. A range,
+      a tag, a path or no version fails the run: CI does not float, the same reason
+      the CLI is pinned. They come from the registry ~/.npmrc maps their scope to, so
+      a @beplus plugin needs BE_NPM_AUTH (with BE_NPM_TARGET and BE_NPM_TOKEN). Needs
+      npm and jq. Empty (the default): none.
+    required: false
+    default: ""
   BE_PREFIX:
     description: "Install prefix for beplus binaries (must be writable)."
     required: false
@@ -255,3 +265,49 @@ runs:
           rm -f "$err"
         done
         exit "$failed"
+
+    # A plugin is code that runs as the job, so it is pinned like the CLI: an exact
+    # version, or the run fails. `beplus plugin install` checks the plugin's
+    # @beplus/cli-sdk peer range against this CLI and refuses a namespace a bundled
+    # plugin or a core command owns; then the CLI is asked which version it loads.
+    - name: Install beplus CLI plugins
+      if: ${{ inputs.BE_PLUGINS != '' }}
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        PLUGINS: ${{ inputs.BE_PLUGINS }}
+      run: |
+        set -euo pipefail
+        command -v npm > /dev/null || { echo "::error::BE_PLUGINS needs npm on PATH (actions/setup-node first)."; exit 1; }
+        command -v jq > /dev/null || { echo "::error::BE_PLUGINS needs jq on PATH."; exit 1; }
+
+        # <package>@<exact SemVer>: a scoped or plain npm name, then MAJOR.MINOR.PATCH
+        # with an optional prerelease. Every spec is checked before anything is installed.
+        exact='^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+        read -r -a specs <<< "$(printf '%s' "$PLUGINS" | tr '\n' ' ')"
+        bad=0
+        for spec in "${specs[@]}"; do
+          if [[ ! "$spec" =~ $exact ]]; then
+            echo "::error::BE_PLUGINS: \"$spec\" is not <package>@<exact version> (e.g. @beplus/cli-plugin-electron@0.1.0). A range, a tag or a path would let this run change without a commit."
+            bad=1
+          fi
+        done
+        [ "$bad" -eq 0 ] || exit 1
+
+        for spec in "${specs[@]}"; do
+          name="${spec%@*}"
+          version="${spec##*@}"
+          if ! out="$(beplus plugin install "$spec" --json)"; then
+            printf '%s\n' "$out" | jq -r '"::error::BE_PLUGINS: \(.error.message // "beplus plugin install failed") \(.error.suggestion // "")"' 2> /dev/null \
+              || echo "::error::BE_PLUGINS: beplus plugin install $spec failed."
+            exit 1
+          fi
+          ns="$(printf '%s' "$out" | jq -r '.data.namespace')"
+          # What the CLI now loads under that namespace: this package, at this version.
+          loaded="$(beplus plugin list --json | jq -r --arg ns "$ns" '.data.plugins[] | select(.namespace == $ns) | "\(.source) \(.version)"')"
+          if [[ "$loaded" != "user $version" ]]; then
+            echo "::error::BE_PLUGINS: $name installed, but beplus loads '$ns' as ${loaded:-nothing}, not $version."
+            exit 1
+          fi
+          echo "✓ $name $version → beplus $ns"
+        done
