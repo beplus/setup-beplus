@@ -1,0 +1,866 @@
+# A desktop app's release, for macOS, Windows and Linux, written once.
+# ---------------------------------------------------------------------
+# bepluscloud's beplus app, Mountaineer's and MRKIT's each carry an Electron shell over their
+# deployed console. bepluscloud released Mac, Windows and Linux from one tag. The other two had
+# copies of its Mac half, about 215 lines each, that differed only by names. This file is that
+# release, with the names as inputs:
+#
+#   on:
+#     push:
+#       tags: ["mountaineer/desktop/v*"]
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#     id-token: write          # publish's, for the release role
+#   concurrency:
+#     group: desktop-release
+#     cancel-in-progress: false
+#   jobs:
+#     release:
+#       uses: beplus/setup-beplus/.github/workflows/desktop-release.yml@v2
+#       with:
+#         app-dir: packages/apps/desktop
+#         project: "@mountaineer/desktop"
+#         product: Mountaineer
+#         tag-prefix: mountaineer/desktop/v
+#         feed-url: https://desktop.mountaineer.im/mountaineer
+#         release-role: arn:aws:iam::270953801504:role/github-actions-ironmountain-cz-monorepo-main-desktop-release
+#         release-bucket: be-desktop-releases-270953801504
+#         s3-prefix: mountaineer
+#         environment: shared
+#         windows: ${{ vars.BE_DESKTOP_WINDOWS }}
+#         linux: ${{ vars.BE_DESKTOP_LINUX }}
+#         npm-target: ${{ vars.BE_NPM_TARGET }}
+#       secrets:
+#         BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+#
+# The jobs:
+#
+#   plan          reads the package's version and checks the tag names it (`<tag-prefix><version>`),
+#                 and decides which platforms build.
+#   build-mac     on a tag. Claims `environment` for its secrets: the npm token, fastlane's match
+#                 password, the App Store Connect key, and the GitHub App that reads the match store
+#                 (`signing-repo`, beplus/apple-signing by default). It grants no AWS access. Builds both architectures in ONE
+#                 electron-builder run (`bundle exec fastlane build`), so there is one latest-mac.yml.
+#                 Then it signs, notarizes, checks that Gatekeeper accepts the app, and smoke-tests
+#                 the packaged app.
+#   build-windows when `windows` is `unsigned` or `signed`, or by hand. Both architectures go into ONE
+#                 NSIS installer and one latest.yml, and the packaged app is smoke-tested.
+#                   unsigned  published unsigned, until Azure Trusted Signing is approved (SmartScreen
+#                             asks once, "Run anyway").
+#                   signed    signed through Trusted Signing (BE_WIN_SIGNING_* and AZURE_*).
+#                 Going from unsigned to signed works one way only: an unsigned copy takes a signed
+#                 update, because it names no publisher, but a signed copy refuses an unsigned one.
+#   build-linux   when `linux` is `on`, or by hand. A .deb and an AppImage for x64 and arm64 in ONE run
+#                 (latest-linux.yml, latest-linux-arm64.yml), on ubuntu-22.04, whose glibc is the
+#                 oldest the app supports. The x64 AppImage and the installed x64 .deb are
+#                 smoke-tested under Xvfb. Each release adds SHA256SUMS-<version>-linux.txt.
+#   check-windows after build-windows, on ubuntu: `beplus electron check win` on the Windows pack.
+#                 The beplus CLI cannot be set up on a Windows runner yet (`be` has no Windows build),
+#                 so build-windows hands over what the check reads.
+#   publish       on a tag. Claims NO environment: the release role trusts the tag's subject
+#                 (`repo:<owner>/<repo>:ref:refs/tags/<tag-prefix>*`), but a job that claims an
+#                 environment presents `…:environment:<name>` instead. It uploads the installers
+#                 first and the manifests last, so no installed copy is offered a file that is not
+#                 there yet. Then it reads the feed back. A version is published once: publish
+#                 refuses a tag whose files are already in the bucket.
+#
+# By hand (Run workflow, any branch), Windows packs UNSIGNED and Linux packs as it would on a tag.
+# Their files are kept as the run's artifacts `windows-try` and `linux-try`, and nothing is
+# published. The Mac does not build on a manual run: an unsigned Mac app is no try at all.
+#
+# After each pack, `beplus electron check` checks it: the fuses, both architectures, the installers
+# and manifests, the .debs' insides, and the Windows and Linux icons. That is @beplus/cli-plugin-electron
+# (beplus/desktop, BE-281), which the CLI does not bundle: each job installs it through the cli action's
+# BE_CLI_PLUGINS at the version below (BE_ELECTRON_PLUGIN), the one this workflow was tried with.
+#
+# What the app package (`app-dir`) must provide:
+#   - `bundle exec fastlane build` (Gemfile, .ruby-version, fastlane/), which runs `npm run dist:mac`;
+#     and the npm scripts `dist:win`, `dist:win:local` and `dist:linux`;
+#   - a packer that writes BE_DESKTOP_UPDATE_URL into app-update.yml as its feed;
+#   - electron-builder's default Mac names (`<product>-<v>-arm64.dmg`, `<product>-<v>.dmg`,
+#     `<product>-<v>-arm64-mac.zip`, `<product>-<v>-mac.zip`); nsis.artifactName
+#     `<product>-Setup-${version}.${ext}`; appImage.artifactName `<product>-${version}-${arch}.${ext}`;
+#     deb.artifactName `<product>_${version}_${arch}.${ext}`, which installs to
+#     /opt/<product>/<executable>; `linux.executableName`, `win.icon`, `linux.icon`, a `protocols` scheme, and
+#     package.json's `desktopName` and `homepage` (`beplus docs show electron`);
+#   - a smoke run: `BE_DESKTOP_SMOKE=1 <app>` loads the console and prints a JSON line last that holds
+#     `"smoke":"ok"` and `"version":"<version>"`; BE_DESKTOP_SMOKE_SHOT=<file> keeps a picture of it.
+#
+# Secrets are passed BY NAME (`secrets:`), not with `inherit`: GitHub passes inherited secrets only
+# to a reusable workflow in the same organization or enterprise. Secrets of `environment` are read
+# directly by the jobs that claim it, so they need no passing.
+
+name: Desktop Release
+
+on:
+  workflow_call:
+    inputs:
+      app-dir:
+        description: The desktop package's folder, relative to the repository (e.g. packages/apps/desktop).
+        required: true
+        type: string
+      project:
+        description: Its Rush project, which `rush install --to` and `rush build --to` name (e.g. "@mountaineer/desktop").
+        required: true
+        type: string
+      product:
+        description: >-
+          electron-builder's productName, with no spaces: <product>.app, <product>.exe, /opt/<product>,
+          and the start of every file the feed serves.
+        required: true
+        type: string
+      executable:
+        description: The Linux executable (linux.executableName). Default is the product name in lower case.
+        required: false
+        type: string
+        default: ""
+      tag-prefix:
+        description: The tag without its version (e.g. mountaineer/desktop/v). The version is app-dir's package.json version.
+        required: true
+        type: string
+      feed-url:
+        description: The update feed installed copies read (e.g. https://desktop.mountaineer.im/mountaineer).
+        required: true
+        type: string
+      release-role:
+        description: The IAM role publish assumes. It must trust the tag's subject.
+        required: true
+        type: string
+      release-bucket:
+        description: The feed's bucket.
+        required: true
+        type: string
+      s3-prefix:
+        description: The key prefix in the bucket that the feed's path serves (e.g. mountaineer).
+        required: true
+        type: string
+      aws-region:
+        description: The release role's region.
+        required: false
+        type: string
+        default: us-east-1
+      environment:
+        description: The GitHub environment the build jobs claim for their secrets (e.g. shared, main).
+        required: true
+        type: string
+      signing-repo:
+        description: >-
+          The fastlane match store holding the Developer ID certificate and the app's profile, as owner/name. The
+          beplus GitHub App (or the caller's own, by BE_GITHUB_APP_*) must be installed on its owner.
+        required: false
+        type: string
+        default: beplus/apple-signing
+      mac:
+        description: Build and publish the Mac app on a tag.
+        required: false
+        type: boolean
+        default: true
+      windows:
+        description: How a tag releases Windows. Empty means not at all; also unsigned or signed. Pass vars.BE_DESKTOP_WINDOWS.
+        required: false
+        type: string
+        default: ""
+      linux:
+        description: Whether a tag releases Linux. `on` releases it; empty means not at all. Pass vars.BE_DESKTOP_LINUX.
+        required: false
+        type: string
+        default: ""
+      npm-target:
+        description: The beplus npm registry's domain (npm.<target>). Pass vars.BE_NPM_TARGET. Default is beplus.cloud.
+        required: false
+        type: string
+        default: ""
+      node-version:
+        description: Node for every job.
+        required: false
+        type: string
+        default: "22.14"
+      test:
+        description: The tests, in app-dir, before the Mac pack.
+        required: false
+        type: string
+        default: npm test
+      test-windows:
+        description: The tests on Windows. Default is `test`.
+        required: false
+        type: string
+        default: ""
+      test-linux:
+        description: The tests on Linux. Default is `test`.
+        required: false
+        type: string
+        default: ""
+      linux-apt:
+        description: Extra apt packages for the Linux job (xvfb is always installed).
+        required: false
+        type: string
+        default: ""
+      build-env:
+        description: >-
+          KEY=VALUE lines, one per line, set for every pack and smoke run (e.g. a Sentry DSN, or the
+          BE_WIN_SIGNING_* settings). These are not secrets: put a secret in `environment`.
+        required: false
+        type: string
+        default: ""
+      smoke-match:
+        description: A fixed string the smoke line must also contain (e.g. the console's origin).
+        required: false
+        type: string
+        default: ""
+    secrets:
+      BE_NPM_TOKEN:
+        required: false
+      BE_GITHUB_APP_ID:
+        required: false
+      BE_GITHUB_APP_PRIVATE_KEY:
+        required: false
+      BE_APPSTORE_CONNECT_KEY_ID:
+        required: false
+      BE_APPSTORE_CONNECT_KEY_ISSUER_ID:
+        required: false
+      BE_APPSTORE_CONNECT_KEY_CONTENT:
+        required: false
+      BE_FASTLANE_MATCH_PASSWORD:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_CLIENT_SECRET:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # The pack checks' plugin, at the exact version this workflow was tried with (cli action BE_CLI_PLUGINS).
+  BE_ELECTRON_PLUGIN: "@beplus/cli-plugin-electron@0.1.0-next.1"
+  APP_DIR: ${{ inputs.app-dir }}
+  PRODUCT: ${{ inputs.product }}
+  FEED_URL: ${{ inputs.feed-url }}
+  BE_DESKTOP_UPDATE_URL: ${{ inputs.feed-url }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      executable: ${{ steps.plan.outputs.executable }}
+      mac: ${{ steps.plan.outputs.mac }}
+      windows: ${{ steps.plan.outputs.windows }}
+      linux: ${{ steps.plan.outputs.linux }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ${{ inputs.app-dir }}/package.json
+          sparse-checkout-cone-mode: false
+
+      - name: The version, the tag and the platforms
+        id: plan
+        env:
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          EXECUTABLE: ${{ inputs.executable }}
+          MAC: ${{ inputs.mac }}
+          WINDOWS: ${{ inputs.windows }}
+          LINUX: ${{ inputs.linux }}
+        run: |
+          set -euo pipefail
+          if [[ "$PRODUCT" =~ [[:space:]] || -z "$PRODUCT" ]]; then
+            echo "::error::product is '${PRODUCT}': it names files the feed serves, so it has no spaces."
+            exit 1
+          fi
+          case "$WINDOWS" in ""|unsigned|signed) ;; *) echo "::error::windows is '${WINDOWS}', not empty, unsigned or signed."; exit 1 ;; esac
+          case "$LINUX" in ""|on|off) ;; *) echo "::error::linux is '${LINUX}', not empty or on."; exit 1 ;; esac
+          VERSION=$(node -p "require('./${APP_DIR}/package.json').version")
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_NAME}" != "${TAG_PREFIX}${VERSION}" ]; then
+            echo "::error::The tag is ${GITHUB_REF_NAME}, but ${APP_DIR}/package.json says ${VERSION} (${TAG_PREFIX}${VERSION})."
+            exit 1
+          fi
+          push=false; [ "${GITHUB_EVENT_NAME}" = "push" ] && push=true
+          dispatch=false; [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && dispatch=true
+          mac=false; [ "$push" = true ] && [ "$MAC" = true ] && mac=true
+          windows=false; { [ "$dispatch" = true ] || { [ "$push" = true ] && [ -n "$WINDOWS" ]; }; } && windows=true
+          linux=false; { [ "$dispatch" = true ] || { [ "$push" = true ] && [ "$LINUX" = on ]; }; } && linux=true
+          {
+            echo "version=${VERSION}"
+            echo "executable=${EXECUTABLE:-${PRODUCT,,}}"
+            echo "mac=${mac}"
+            echo "windows=${windows}"
+            echo "linux=${linux}"
+          } | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "### ${PRODUCT} ${VERSION}"
+            echo ""
+            echo "| Platform | Builds |"
+            echo "|---|---|"
+            echo "| macOS | ${mac} |"
+            echo "| Windows | ${windows}${WINDOWS:+ (${WINDOWS})} |"
+            echo "| Linux | ${linux} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-mac:
+    needs: plan
+    if: needs.plan.outputs.mac == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: The caller's build settings
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: printf '%s\n' "$BUILD_ENV" | { grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true; } >> "$GITHUB_ENV"
+
+      - uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ inputs.npm-target || vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_NPM_AUTH: true
+          BE_CLI_PLUGINS: ${{ env.BE_ELECTRON_PLUGIN }}
+
+      - name: Install and build the desktop
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          node common/scripts/install-run-rush.js install --to "$PROJECT"
+          node common/scripts/install-run-rush.js build --to "$PROJECT"
+
+      - name: Test
+        working-directory: ${{ inputs.app-dir }}
+        env:
+          TEST: ${{ inputs.test }}
+        run: eval "$TEST"
+
+      # fastlane holds what Apple issues: match reads the Developer ID certificate and the app's
+      # profile from `signing-repo` (beplus/apple-signing by default), with a read-only token, and the App
+      # Store Connect API key notarizes. Ruby and fastlane are the package's (.ruby-version, Gemfile).
+      - name: Ruby and fastlane
+        uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1.328.0
+        with:
+          working-directory: ${{ inputs.app-dir }}
+          bundler-cache: true
+
+      - id: signing-repo
+        name: The match store (signing-repo)
+        env:
+          SIGNING_REPO: ${{ inputs.signing-repo }}
+        run: |
+          if [[ ! "$SIGNING_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::signing-repo is '${SIGNING_REPO}', not owner/name."
+            exit 1
+          fi
+          echo "owner=${SIGNING_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${SIGNING_REPO#*/}" >> "$GITHUB_OUTPUT"
+
+      - id: signing
+        name: A read-only token for the match store (one hour)
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BE_GITHUB_APP_ID || secrets.BE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.BE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ steps.signing-repo.outputs.owner }}
+          repositories: ${{ steps.signing-repo.outputs.name }}
+          permission-contents: read
+
+      - name: Package, sign and notarize (arm64 and x64)
+        working-directory: ${{ inputs.app-dir }}
+        env:
+          BE_APPSTORE_CONNECT_KEY_ID: ${{ vars.BE_APPSTORE_CONNECT_KEY_ID || secrets.BE_APPSTORE_CONNECT_KEY_ID }}
+          BE_APPSTORE_CONNECT_KEY_ISSUER_ID: ${{ secrets.BE_APPSTORE_CONNECT_KEY_ISSUER_ID }}
+          BE_APPSTORE_CONNECT_KEY_CONTENT: ${{ secrets.BE_APPSTORE_CONNECT_KEY_CONTENT }}
+          BE_FASTLANE_MATCH_PASSWORD: ${{ secrets.BE_FASTLANE_MATCH_PASSWORD }}
+          BE_FASTLANE_MATCH_STORAGE_GIT_TOKEN: ${{ steps.signing.outputs.token }}
+          LC_ALL: en_US.UTF-8
+          LANG: en_US.UTF-8
+          FASTLANE_SKIP_UPDATE_CHECK: "1"
+          FASTLANE_HIDE_CHANGELOG: "1"
+          FASTLANE_OPT_OUT_USAGE: "YES"
+        run: bundle exec fastlane build
+
+      - name: Signed, notarized, and what it should be
+        working-directory: ${{ inputs.app-dir }}
+        run: |
+          set -euo pipefail
+          # electron-builder notarizes and staples the APP, not the dmg or zip around it: the ticket
+          # travels inside the bundle, so Gatekeeper accepts it offline from either container.
+          for app in "release/mac-arm64/${PRODUCT}.app" "release/mac/${PRODUCT}.app"; do
+            test -s "$app/Contents/embedded.provisionprofile"
+            codesign --verify --deep --strict --verbose=2 "$app"
+            spctl --assess --type execute --verbose=2 "$app"
+            xcrun stapler validate "$app"
+          done
+          for f in "release/${PRODUCT}-${VERSION}-arm64.dmg" "release/${PRODUCT}-${VERSION}.dmg" \
+                   "release/${PRODUCT}-${VERSION}-arm64-mac.zip" "release/${PRODUCT}-${VERSION}-mac.zip"; do
+            test -s "$f" || { echo "::error::$f is missing"; exit 1; }
+          done
+          grep -q "^version: ${VERSION}$" release/latest-mac.yml
+          grep -q "url: ${FEED_URL}" "release/mac-arm64/${PRODUCT}.app/Contents/Resources/app-update.yml"
+
+      # Each packed app's fuses (`beplus electron check`, BE-281).
+      - name: The pack is what it should be
+        run: beplus electron check mac --path "$APP_DIR"
+
+      - name: The packaged app loads its console
+        working-directory: ${{ inputs.app-dir }}
+        env:
+          SMOKE_MATCH: ${{ inputs.smoke-match }}
+        run: |
+          set -euo pipefail
+          RESULT=$(BE_DESKTOP_SMOKE=1 BE_DESKTOP_SMOKE_SHOT="$RUNNER_TEMP/smoke-mac.png" \
+            "release/mac-arm64/${PRODUCT}.app/Contents/MacOS/${PRODUCT}" 2>/dev/null | tail -1)
+          echo "$RESULT"
+          echo "$RESULT" | grep -q '"smoke":"ok"'
+          echo "$RESULT" | grep -q "\"version\":\"${VERSION}\""
+          [ -z "$SMOKE_MATCH" ] || echo "$RESULT" | grep -qF -- "$SMOKE_MATCH"
+
+      - name: Keep the smoke test's picture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-mac
+          path: ${{ runner.temp }}/smoke-mac.png
+          if-no-files-found: ignore
+
+      - name: Hand the release files to publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-mac
+          path: |
+            ${{ inputs.app-dir }}/release/*.dmg
+            ${{ inputs.app-dir }}/release/*.zip
+            ${{ inputs.app-dir }}/release/*.blockmap
+            ${{ inputs.app-dir }}/release/latest-mac.yml
+          if-no-files-found: error
+
+  build-windows:
+    needs: plan
+    if: needs.plan.outputs.windows == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # The Trusted Signing account and profile come from the environment's variables, and the
+      # caller's build-env can name them instead (its lines go last, so they win).
+      - name: The caller's build settings
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
+          V_ENDPOINT: ${{ vars.BE_WIN_SIGNING_ENDPOINT }}
+          V_ACCOUNT: ${{ vars.BE_WIN_SIGNING_ACCOUNT }}
+          V_PROFILE: ${{ vars.BE_WIN_SIGNING_PROFILE }}
+          V_PUBLISHER: ${{ vars.BE_WIN_SIGNING_PUBLISHER }}
+        run: |
+          {
+            [ -z "$V_ENDPOINT" ] || echo "BE_WIN_SIGNING_ENDPOINT=$V_ENDPOINT"
+            [ -z "$V_ACCOUNT" ] || echo "BE_WIN_SIGNING_ACCOUNT=$V_ACCOUNT"
+            [ -z "$V_PROFILE" ] || echo "BE_WIN_SIGNING_PROFILE=$V_PROFILE"
+            [ -z "$V_PUBLISHER" ] || echo "BE_WIN_SIGNING_PUBLISHER=$V_PUBLISHER"
+            printf '%s\n' "$BUILD_ENV" | { grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true; }
+          } >> "$GITHUB_ENV"
+
+      # Rush reads npm.beplus.cloud's token from ~/.npmrc. The cli action has not been tried on Windows
+      # yet, and this job needs no CLI, so the registry line is written here, as beplus/cli_v2's
+      # release-binary.yml writes it.
+      - name: The beplus npm registry
+        env:
+          BE_NPM_TARGET: ${{ inputs.npm-target || vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        run: |
+          target="${BE_NPM_TARGET:-beplus.cloud}"
+          printf '%s\n' "@beplus:registry=https://npm.${target}/" "//npm.${target}/:_authToken=${BE_NPM_TOKEN}" >> "${HOME}/.npmrc"
+
+      - name: Install and build the desktop
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          node common/scripts/install-run-rush.js install --to "$PROJECT"
+          node common/scripts/install-run-rush.js build --to "$PROJECT"
+
+      - name: Test
+        working-directory: ${{ inputs.app-dir }}
+        env:
+          TEST: ${{ inputs.test-windows || inputs.test }}
+        run: eval "$TEST"
+
+      # The app's packer reads each signature back from a signed pack (only Windows can);
+      # check-windows checks the rest. An unsigned pack's
+      # app-update.yml names no publisher, so the copies installed from it take the first signed
+      # update without a manual install.
+      - name: Package (x64 and arm64), signed when `windows` says so
+        working-directory: ${{ inputs.app-dir }}
+        env:
+          BE_DESKTOP_WINDOWS: ${{ inputs.windows }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${BE_DESKTOP_WINDOWS}" = "signed" ]; then
+            npm run dist:win
+          else
+            npm run dist:win:local
+            if grep -q "publisherName" release/win-unpacked/resources/app-update.yml; then
+              echo "::error::An unsigned pack names a publisher: its copies would refuse every update."
+              exit 1
+            fi
+          fi
+          test -s "release/${PRODUCT}-Setup-${VERSION}.exe"
+          grep -q "^version: ${VERSION}$" release/latest.yml
+          grep -q "url: ${FEED_URL}" release/win-unpacked/resources/app-update.yml
+
+      # What `beplus electron check win` reads, for check-windows: both architectures' exe, the
+      # installer and latest.yml. The .ico is the checkout's. Under release/, as electron-builder wrote it.
+      - name: Hand the pack to its check
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-pack
+          path: |
+            ${{ inputs.app-dir }}/release/win-unpacked/${{ inputs.product }}.exe
+            ${{ inputs.app-dir }}/release/win-arm64-unpacked/${{ inputs.product }}.exe
+            ${{ inputs.app-dir }}/release/${{ inputs.product }}-Setup-*.exe
+            ${{ inputs.app-dir }}/release/latest.yml
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: The packaged app loads its console
+        working-directory: ${{ inputs.app-dir }}
+        shell: pwsh
+        env:
+          SMOKE_MATCH: ${{ inputs.smoke-match }}
+        run: |
+          $env:BE_DESKTOP_SMOKE = "1"
+          $env:BE_DESKTOP_SMOKE_SHOT = Join-Path $env:RUNNER_TEMP "smoke-windows.png"
+          $out = Join-Path $env:RUNNER_TEMP "smoke-windows.txt"
+          # A GUI app: Start-Process waits for it and keeps what it prints.
+          Start-Process -FilePath "release\win-unpacked\$($env:PRODUCT).exe" -Wait -NoNewWindow -RedirectStandardOutput $out
+          $result = Get-Content $out | Select-Object -Last 1
+          Write-Output $result
+          if ($result -notmatch '"smoke":"ok"') { throw "The smoke run did not load the console." }
+          if (-not $result.Contains('"version":"' + $env:VERSION + '"')) { throw "The smoke run reports another version." }
+          if ($env:SMOKE_MATCH -and -not $result.Contains($env:SMOKE_MATCH)) { throw "The smoke run does not show $($env:SMOKE_MATCH)." }
+
+      - name: Keep the smoke test's picture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-windows
+          path: ${{ runner.temp }}/smoke-windows.png
+          if-no-files-found: ignore
+
+      - name: Hand the installer over for a try
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-try
+          path: ${{ inputs.app-dir }}/release/${{ inputs.product }}-Setup-*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Hand the release files to publish
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            ${{ inputs.app-dir }}/release/${{ inputs.product }}-Setup-*.exe
+            ${{ inputs.app-dir }}/release/${{ inputs.product }}-Setup-*.exe.blockmap
+            ${{ inputs.app-dir }}/release/latest.yml
+          if-no-files-found: error
+
+  build-linux:
+    needs: plan
+    if: needs.plan.outputs.linux == 'true'
+    # Not ubuntu-latest: 22.04's glibc (2.35) is the oldest the app supports, and what is built here runs there.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      EXECUTABLE: ${{ needs.plan.outputs.executable }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: The caller's build settings
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: printf '%s\n' "$BUILD_ENV" | { grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true; } >> "$GITHUB_ENV"
+
+      - uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ inputs.npm-target || vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_NPM_AUTH: true
+          BE_CLI_PLUGINS: ${{ env.BE_ELECTRON_PLUGIN }}
+
+      # Xvfb is the smoke runs' screen.
+      - name: The Linux tools
+        env:
+          LINUX_APT: ${{ inputs.linux-apt }}
+        run: |
+          sudo apt-get update -qq
+          # shellcheck disable=SC2086
+          sudo apt-get install -y -qq xvfb $LINUX_APT
+
+      - name: Install and build the desktop
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          node common/scripts/install-run-rush.js install --to "$PROJECT"
+          node common/scripts/install-run-rush.js build --to "$PROJECT"
+
+      - name: Test
+        working-directory: ${{ inputs.app-dir }}
+        env:
+          TEST: ${{ inputs.test-linux || inputs.test }}
+        run: eval "$TEST"
+
+      - name: Package (.deb and AppImage, x64 and arm64)
+        working-directory: ${{ inputs.app-dir }}
+        run: |
+          set -euo pipefail
+          npm run dist:linux
+          grep -q "url: ${FEED_URL}" release/linux-unpacked/resources/app-update.yml
+          # What a person who downloads by hand checks against.
+          (cd release && sha256sum "${PRODUCT}-${VERSION}-"*.AppImage "${PRODUCT}_${VERSION}_"*.deb > "SHA256SUMS-${VERSION}-linux.txt")
+          cat "release/SHA256SUMS-${VERSION}-linux.txt"
+
+      # Both architectures' executable (ELF machine, fuses), both manifests and their files, each .deb's insides
+      # (dpkg-deb runs here), and the packages' icons (`beplus electron check`, BE-281).
+      - name: The pack is what it should be
+        run: beplus electron check linux --path "$APP_DIR"
+
+      # The x64 AppImage, extracted and run because the runner has no FUSE 2, and the x64 .deb,
+      # installed the way a person installs it. Each one loads the console on a virtual screen.
+      - name: The packaged app loads its console
+        working-directory: ${{ inputs.app-dir }}
+        env:
+          SMOKE_MATCH: ${{ inputs.smoke-match }}
+        run: |
+          set -euo pipefail
+          smoke() {
+            local name="$1"; shift
+            local result
+            # A copy that cannot have Chromium's sandbox says why in a dialog nobody here answers: the timeout.
+            result=$(BE_DESKTOP_SMOKE=1 BE_DESKTOP_SMOKE_SHOT="$RUNNER_TEMP/smoke-linux-$name.png" timeout 300 xvfb-run -a -s "-screen 0 1440x900x24" "$@" 2>/dev/null | tail -1)
+            echo "$name: $result"
+            echo "$result" | grep -q '"smoke":"ok"'
+            echo "$result" | grep -q "\"version\":\"${VERSION}\""
+            [ -z "$SMOKE_MATCH" ] || echo "$result" | grep -qF -- "$SMOKE_MATCH"
+          }
+          appimage=$(ls "release/${PRODUCT}-${VERSION}-"*.AppImage | grep -v arm64)
+          APPIMAGE_EXTRACT_AND_RUN=1 smoke appimage "$appimage"
+          deb=$(ls "release/${PRODUCT}_${VERSION}_"*.deb | grep -v arm64)
+          sudo apt-get install -y -qq "./$deb"
+          test -x "/opt/${PRODUCT}/${EXECUTABLE}"
+          grep -lq "^Exec=/opt/${PRODUCT}/${EXECUTABLE} %U$" /usr/share/applications/*.desktop
+          smoke deb "/opt/${PRODUCT}/${EXECUTABLE}"
+
+      - name: Keep the smoke tests' pictures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-linux
+          path: ${{ runner.temp }}/smoke-linux-*.png
+          if-no-files-found: ignore
+
+      - name: Hand the files over for a try
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-try
+          path: |
+            ${{ inputs.app-dir }}/release/*.AppImage
+            ${{ inputs.app-dir }}/release/*.deb
+            ${{ inputs.app-dir }}/release/SHA256SUMS-*-linux.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Hand the release files to publish
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            ${{ inputs.app-dir }}/release/*.AppImage
+            ${{ inputs.app-dir }}/release/*.deb
+            ${{ inputs.app-dir }}/release/SHA256SUMS-*-linux.txt
+            ${{ inputs.app-dir }}/release/latest-linux.yml
+            ${{ inputs.app-dir }}/release/latest-linux-arm64.yml
+          if-no-files-found: error
+
+  # Windows' pack, checked here: the beplus CLI cannot be set up on a Windows runner yet (`be` has
+  # no Windows build). The exes' machine and fuses, the installer, latest.yml and the .ico's tile
+  # (`beplus electron check win`, BE-281). publish waits for it; a try (workflow_dispatch) runs it too.
+  check-windows:
+    needs: [plan, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ inputs.npm-target || vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_NPM_AUTH: true
+          BE_CLI_PLUGINS: ${{ env.BE_ELECTRON_PLUGIN }}
+
+      - name: Windows' pack
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-pack
+          path: ${{ inputs.app-dir }}/release
+
+      - name: The pack is what it should be
+        run: beplus electron check win --path "$APP_DIR"
+
+  publish:
+    # Every platform that built. A skipped one publishes the others without it; a failed one
+    # publishes nothing.
+    needs: [plan, build-mac, build-windows, check-windows, build-linux]
+    if: >-
+      always() && github.event_name == 'push' && needs.plan.result == 'success' &&
+      (needs.build-mac.result == 'success' || needs.build-mac.result == 'skipped') &&
+      (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+      (needs.build-windows.result != 'success' || needs.check-windows.result == 'success') &&
+      (needs.build-linux.result == 'success' || needs.build-linux.result == 'skipped') &&
+      (needs.build-mac.result == 'success' || needs.build-windows.result == 'success' || needs.build-linux.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # No `environment:`. See the top of this file.
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      RELEASE_BUCKET: ${{ inputs.release-bucket }}
+      S3_PREFIX: ${{ inputs.s3-prefix }}
+    steps:
+      - name: The Mac's files
+        if: needs.build-mac.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-mac
+          path: release
+
+      - name: Windows' files
+        if: needs.build-windows.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: release
+
+      - name: Linux's files
+        if: needs.build-linux.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: release
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.release-role }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: A version is published once
+        run: |
+          for key in "${PRODUCT}-${VERSION}-mac.zip" "${PRODUCT}-Setup-${VERSION}.exe" "SHA256SUMS-${VERSION}-linux.txt"; do
+            if aws s3api head-object --bucket "$RELEASE_BUCKET" --key "${S3_PREFIX}/$key" >/dev/null 2>&1; then
+              echo "::error::${PRODUCT} ${VERSION} is already published ($key). Bump the version and tag again."
+              exit 1
+            fi
+          done
+
+      - name: Upload the installers, then the manifests
+        working-directory: release
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # Immutable under their versioned names.
+          for f in *.dmg *.zip *.exe *.blockmap *.AppImage *.deb SHA256SUMS-*-linux.txt; do
+            aws s3 cp "$f" "s3://$RELEASE_BUCKET/${S3_PREFIX}/$f" --cache-control "public, max-age=31536000, immutable" --only-show-errors
+          done
+          # Last: from this moment installed copies are offered the new version, each platform by its own manifest.
+          for manifest in latest-mac.yml latest.yml latest-linux.yml latest-linux-arm64.yml; do
+            [ -f "$manifest" ] || continue
+            aws s3 cp "$manifest" "s3://$RELEASE_BUCKET/${S3_PREFIX}/$manifest" --cache-control "no-cache" --content-type "text/yaml" --only-show-errors
+          done
+
+      - name: The feed offers it
+        working-directory: release
+        env:
+          WINDOWS: ${{ inputs.windows }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          {
+            echo "### ${PRODUCT} ${VERSION} is published"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f latest-mac.yml ]; then
+            curl -fsS "$FEED_URL/latest-mac.yml" | tee /dev/stderr | grep -q "^version: ${VERSION}$"
+            curl -fsSI "$FEED_URL/${PRODUCT}-${VERSION}-arm64.dmg" | head -1
+            echo "- Apple silicon: $FEED_URL/${PRODUCT}-${VERSION}-arm64.dmg" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Intel: $FEED_URL/${PRODUCT}-${VERSION}.dmg" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f latest.yml ]; then
+            curl -fsS "$FEED_URL/latest.yml" | tee /dev/stderr | grep -q "^version: ${VERSION}$"
+            curl -fsSI "$FEED_URL/${PRODUCT}-Setup-${VERSION}.exe" | head -1
+            echo "- Windows (x64 and Arm, ${WINDOWS}): $FEED_URL/${PRODUCT}-Setup-${VERSION}.exe" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          for manifest in latest-linux.yml latest-linux-arm64.yml; do
+            [ -f "$manifest" ] || continue
+            curl -fsS "$FEED_URL/$manifest" | tee /dev/stderr | grep -q "^version: ${VERSION}$"
+          done
+          if [ -f latest-linux.yml ]; then
+            curl -fsSI "$FEED_URL/SHA256SUMS-${VERSION}-linux.txt" | head -1
+            for f in "${PRODUCT}_${VERSION}_"*.deb "${PRODUCT}-${VERSION}-"*.AppImage "SHA256SUMS-${VERSION}-linux.txt"; do
+              echo "- Linux: $FEED_URL/$f" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+          {
+            echo ""
+            echo "Installed copies are offered it within four hours, or at once from Check for Updates."
+          } >> "$GITHUB_STEP_SUMMARY"
