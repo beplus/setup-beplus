@@ -504,6 +504,10 @@ jobs:
   installer for x64 and arm64. `signed` goes through Azure Trusted Signing
   (`BE_WIN_SIGNING_*`, `AZURE_*`). `unsigned` checks that the pack names no
   publisher, so its copies take the first signed update.
+- **check-windows** (after build-windows, on ubuntu) runs `beplus electron
+  check win` on the Windows pack. The beplus CLI cannot be set up on a Windows
+  runner yet (`be` has no Windows build), so build-windows hands the two exes,
+  the installer and latest.yml over as the artifact `windows-pack`.
 - **build-linux** (when `linux` is `on`) builds a .deb and an AppImage for x64
   and arm64 on ubuntu-22.04, writes `SHA256SUMS-<version>-linux.txt`, and
   smoke-tests the AppImage and the installed .deb under Xvfb.
@@ -515,9 +519,23 @@ jobs:
   keeps them as the run's artifacts `windows-try` and `linux-try`, and
   publishes nothing.
 
+After each pack, **`beplus electron check mac|win|linux`** checks it: the
+Electron fuses, both architectures, the installers and manifests, the .debs'
+insides, and the Windows and Linux icons (the rounded tile). That is
+[`@beplus/cli-plugin-electron`](https://github.com/beplus/desktop/tree/dev/packages/cli/plugin-electron),
+one copy for every estate (BE-281). The CLI does not bundle it, so each job
+installs it with the [`cli`](./cli/README.md#plugins) action's `BE_CLI_PLUGINS`, at
+the exact version the workflow names (`BE_ELECTRON_PLUGIN`). A setup-beplus
+release moves that version, so a caller changes nothing. The same plugin draws
+an app's icons from its artwork (`beplus electron icons`), and
+`beplus docs show electron` is its guide.
+
 What the app must provide: `bundle exec fastlane build` for the Mac, the npm
 scripts `dist:win`, `dist:win:local` and `dist:linux`, and a packer that writes
-`BE_DESKTOP_UPDATE_URL` into app-update.yml. The file names are electron-builder's
+`BE_DESKTOP_UPDATE_URL` into app-update.yml. The check reads its names from
+electron-builder.yml: `productName`, `linux.executableName`, a `protocols`
+scheme, `win.icon` and `linux.icon`, and package.json's `desktopName` (fpm also
+wants `homepage` for the .deb). The file names are electron-builder's
 defaults for the Mac; `nsis.artifactName` is `<product>-Setup-${version}.${ext}`,
 `appImage.artifactName` is `<product>-${version}-${arch}.${ext}`, and
 `deb.artifactName` is `<product>_${version}_${arch}.${ext}`, which installs to
