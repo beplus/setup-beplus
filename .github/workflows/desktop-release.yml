@@ -55,6 +55,9 @@
 #                 (latest-linux.yml, latest-linux-arm64.yml), on ubuntu-22.04, whose glibc is the
 #                 oldest the app supports. The x64 AppImage and the installed x64 .deb are
 #                 smoke-tested under Xvfb. Each release adds SHA256SUMS-<version>-linux.txt.
+#   check-windows after build-windows, on ubuntu: `beplus electron check win` on the Windows pack.
+#                 The beplus CLI cannot be set up on a Windows runner yet (`be` has no Windows build),
+#                 so build-windows hands over what the check reads.
 #   publish       on a tag. Claims NO environment: the release role trusts the tag's subject
 #                 (`repo:<owner>/<repo>:ref:refs/tags/<tag-prefix>*`), but a job that claims an
 #                 environment presents `…:environment:<name>` instead. It uploads the installers
@@ -66,6 +69,11 @@
 # Their files are kept as the run's artifacts `windows-try` and `linux-try`, and nothing is
 # published. The Mac does not build on a manual run: an unsigned Mac app is no try at all.
 #
+# After each pack, `beplus electron check` checks it: the fuses, both architectures, the installers
+# and manifests, the .debs' insides, and the Windows and Linux icons. That is @beplus/cli-plugin-electron
+# (beplus/desktop, BE-281), which the CLI does not bundle: each job installs it through the cli action's
+# BE_CLI_PLUGINS at the version below (BE_ELECTRON_PLUGIN), the one this workflow was tried with.
+#
 # What the app package (`app-dir`) must provide:
 #   - `bundle exec fastlane build` (Gemfile, .ruby-version, fastlane/), which runs `npm run dist:mac`;
 #     and the npm scripts `dist:win`, `dist:win:local` and `dist:linux`;
@@ -74,7 +82,8 @@
 #     `<product>-<v>-arm64-mac.zip`, `<product>-<v>-mac.zip`); nsis.artifactName
 #     `<product>-Setup-${version}.${ext}`; appImage.artifactName `<product>-${version}-${arch}.${ext}`;
 #     deb.artifactName `<product>_${version}_${arch}.${ext}`, which installs to
-#     /opt/<product>/<executable>;
+#     /opt/<product>/<executable>; `linux.executableName`, `win.icon`, `linux.icon`, a `protocols` scheme, and
+#     package.json's `desktopName` and `homepage` (`beplus docs show electron`);
 #   - a smoke run: `BE_DESKTOP_SMOKE=1 <app>` loads the console and prints a JSON line last that holds
 #     `"smoke":"ok"` and `"version":"<version>"`; BE_DESKTOP_SMOKE_SHOT=<file> keeps a picture of it.
 #
@@ -226,6 +235,8 @@ permissions:
   id-token: write
 
 env:
+  # The pack checks' plugin, at the exact version this workflow was tried with (cli action BE_CLI_PLUGINS).
+  BE_ELECTRON_PLUGIN: "@beplus/cli-plugin-electron@0.1.0-next.1"
   APP_DIR: ${{ inputs.app-dir }}
   PRODUCT: ${{ inputs.product }}
   FEED_URL: ${{ inputs.feed-url }}
@@ -320,6 +331,7 @@ jobs:
           BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
         with:
           BE_NPM_AUTH: true
+          BE_CLI_PLUGINS: ${{ env.BE_ELECTRON_PLUGIN }}
 
       - name: Install and build the desktop
         env:
@@ -398,6 +410,10 @@ jobs:
           done
           grep -q "^version: ${VERSION}$" release/latest-mac.yml
           grep -q "url: ${FEED_URL}" "release/mac-arm64/${PRODUCT}.app/Contents/Resources/app-update.yml"
+
+      # Each packed app's fuses (`beplus electron check`, BE-281).
+      - name: The pack is what it should be
+        run: beplus electron check mac --path "$APP_DIR"
 
       - name: The packaged app loads its console
         working-directory: ${{ inputs.app-dir }}
@@ -493,8 +509,8 @@ jobs:
           TEST: ${{ inputs.test-windows || inputs.test }}
         run: eval "$TEST"
 
-      # The packer checks both architectures' <product>.exe (machine, fuses), the installer and
-      # latest.yml, and reads each signature back from a signed pack. An unsigned pack's
+      # The app's packer reads each signature back from a signed pack (only Windows can);
+      # check-windows checks the rest. An unsigned pack's
       # app-update.yml names no publisher, so the copies installed from it take the first signed
       # update without a manual install.
       - name: Package (x64 and arm64), signed when `windows` says so
@@ -518,6 +534,20 @@ jobs:
           test -s "release/${PRODUCT}-Setup-${VERSION}.exe"
           grep -q "^version: ${VERSION}$" release/latest.yml
           grep -q "url: ${FEED_URL}" release/win-unpacked/resources/app-update.yml
+
+      # What `beplus electron check win` reads, for check-windows: both architectures' exe, the
+      # installer and latest.yml. The .ico is the checkout's. Under release/, as electron-builder wrote it.
+      - name: Hand the pack to its check
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-pack
+          path: |
+            ${{ inputs.app-dir }}/release/win-unpacked/${{ inputs.product }}.exe
+            ${{ inputs.app-dir }}/release/win-arm64-unpacked/${{ inputs.product }}.exe
+            ${{ inputs.app-dir }}/release/${{ inputs.product }}-Setup-*.exe
+            ${{ inputs.app-dir }}/release/latest.yml
+          if-no-files-found: error
+          retention-days: 1
 
       - name: The packaged app loads its console
         working-directory: ${{ inputs.app-dir }}
@@ -594,6 +624,7 @@ jobs:
           BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
         with:
           BE_NPM_AUTH: true
+          BE_CLI_PLUGINS: ${{ env.BE_ELECTRON_PLUGIN }}
 
       # Xvfb is the smoke runs' screen.
       - name: The Linux tools
@@ -617,8 +648,6 @@ jobs:
           TEST: ${{ inputs.test-linux || inputs.test }}
         run: eval "$TEST"
 
-      # The packer checks both architectures' executable (ELF machine, fuses), both manifests and
-      # their files, and each .deb's insides, because dpkg-deb runs here.
       - name: Package (.deb and AppImage, x64 and arm64)
         working-directory: ${{ inputs.app-dir }}
         run: |
@@ -628,6 +657,11 @@ jobs:
           # What a person who downloads by hand checks against.
           (cd release && sha256sum "${PRODUCT}-${VERSION}-"*.AppImage "${PRODUCT}_${VERSION}_"*.deb > "SHA256SUMS-${VERSION}-linux.txt")
           cat "release/SHA256SUMS-${VERSION}-linux.txt"
+
+      # Both architectures' executable (ELF machine, fuses), both manifests and their files, each .deb's insides
+      # (dpkg-deb runs here), and the packages' icons (`beplus electron check`, BE-281).
+      - name: The pack is what it should be
+        run: beplus electron check linux --path "$APP_DIR"
 
       # The x64 AppImage, extracted and run because the runner has no FUSE 2, and the x64 .deb,
       # installed the way a person installs it. Each one loads the console on a virtual screen.
@@ -688,14 +722,49 @@ jobs:
             ${{ inputs.app-dir }}/release/latest-linux-arm64.yml
           if-no-files-found: error
 
+  # Windows' pack, checked here: the beplus CLI cannot be set up on a Windows runner yet (`be` has
+  # no Windows build). The exes' machine and fuses, the installer, latest.yml and the .ico's tile
+  # (`beplus electron check win`, BE-281). publish waits for it; a try (workflow_dispatch) runs it too.
+  check-windows:
+    needs: [plan, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - uses: beplus/setup-beplus/cli@v2
+        env:
+          BE_NPM_TARGET: ${{ inputs.npm-target || vars.BE_NPM_TARGET }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          BE_NPM_AUTH: true
+          BE_CLI_PLUGINS: ${{ env.BE_ELECTRON_PLUGIN }}
+
+      - name: Windows' pack
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-pack
+          path: ${{ inputs.app-dir }}/release
+
+      - name: The pack is what it should be
+        run: beplus electron check win --path "$APP_DIR"
+
   publish:
     # Every platform that built. A skipped one publishes the others without it; a failed one
     # publishes nothing.
-    needs: [plan, build-mac, build-windows, build-linux]
+    needs: [plan, build-mac, build-windows, check-windows, build-linux]
     if: >-
       always() && github.event_name == 'push' && needs.plan.result == 'success' &&
       (needs.build-mac.result == 'success' || needs.build-mac.result == 'skipped') &&
       (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+      (needs.build-windows.result != 'success' || needs.check-windows.result == 'success') &&
       (needs.build-linux.result == 'success' || needs.build-linux.result == 'skipped') &&
       (needs.build-mac.result == 'success' || needs.build-windows.result == 'success' || needs.build-linux.result == 'success')
     runs-on: ubuntu-latest
