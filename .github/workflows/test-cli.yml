@@ -16,6 +16,12 @@
 # BE_NPM_CHECK: with no token the auth is skipped and npm.beplus.cloud answers
 # the @beplus read with HTTP 200 and its stub body, so the check must fail the
 # run — before any install would have.
+#
+# BE_PLUGINS (the `plugins` job): a spec that is not <package>@<exact version>
+# fails the run before anything is installed, and a pinned plugin is installed
+# from npm.beplus.cloud and loaded at exactly its version. That leg needs a
+# token: the repository secret BE_NPM_TOKEN (prod's, where the plugins are
+# released), with the variable BE_NPM_TARGET (beplus.cloud).
 name: Test cli
 
 on:
@@ -127,3 +133,78 @@ jobs:
             exit 1
           fi
           echo "beplus CLI $installed, as expected."
+
+  plugins:
+    name: ${{ matrix.case }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: a plugin range fails the run
+            plugins: "@beplus/cli-plugin-electron@^0.1.0"
+            expect: failure
+          - case: a plugin tag fails the run
+            plugins: "@beplus/cli-plugin-electron@latest"
+            expect: failure
+          - case: a plugin without a version fails the run
+            plugins: "@beplus/cli-plugin-electron"
+            expect: failure
+          - case: a pinned plugin is installed at exactly its version
+            plugins: "@beplus/cli-plugin-electron@0.1.0-next.1"
+            expect: installed
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.14
+
+      - name: The token a real install needs
+        if: ${{ matrix.expect == 'installed' }}
+        env:
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        run: |
+          if [ -z "$BE_NPM_TOKEN" ]; then
+            echo "::error::This leg installs from npm.beplus.cloud and needs the repository secret BE_NPM_TOKEN (prod's token, where the plugins are released) and the variable BE_NPM_TARGET=beplus.cloud."
+            exit 1
+          fi
+
+      - name: Setup beplus CLI with plugins
+        id: setup
+        uses: ./cli
+        continue-on-error: ${{ matrix.expect == 'failure' }}
+        env:
+          BE_NPM_TARGET: ${{ vars.BE_NPM_TARGET || 'beplus.cloud' }}
+          BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+        with:
+          # The plugin's @beplus/cli-sdk peer range wants a CLI from 2.35 on.
+          BE_CLI_VERSION: 2.40.1
+          BE_WORKING_DIRECTORY: ${{ runner.temp }}
+          BE_NPM_AUTH: ${{ matrix.expect == 'installed' && 'true' || 'false' }}
+          BE_PLUGINS: ${{ matrix.plugins }}
+
+      - name: Assert the outcome
+        shell: bash
+        env:
+          CASE: ${{ matrix.case }}
+          EXPECT: ${{ matrix.expect }}
+          OUTCOME: ${{ steps.setup.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$EXPECT" == failure ]]; then
+            if [[ "$OUTCOME" != failure ]]; then
+              echo "::error::The action did not fail — $CASE (outcome: $OUTCOME)."
+              exit 1
+            fi
+            if beplus plugin list --json | jq -e '.data.plugins[] | select(.namespace == "electron")' > /dev/null; then
+              echo "::error::The action failed, but installed the plugin anyway — $CASE."
+              exit 1
+            fi
+            echo "The action failed and installed nothing, as it must: $CASE."
+            exit 0
+          fi
+          # The plugin's commands run: the files its icons command would write.
+          beplus electron icons --dry-run --json --path "$RUNNER_TEMP" | jq -e '.success == true and (.data.files | length) > 0'
+          echo "beplus electron runs: $CASE."
