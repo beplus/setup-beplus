@@ -14,7 +14,7 @@ Composite GitHub Action that installs [@beplus/be](https://github.com/beplus/be)
 3. Verifies `beplus --version` — and, for a pinned run, fails unless it is exactly the pinned version
 4. Optionally runs `beplus npm auth` if enabled and required environment variables are present
 5. Optionally (`BE_NPM_CHECK`) proves the registry then serves real `@beplus` packages — see [The registry never says no](#the-registry-never-says-no)
-6. Optionally (`BE_PLUGINS`) installs beplus CLI plugins at exact versions — see [Plugins](#plugins)
+6. Optionally (`BE_CLI_PLUGINS`) installs beplus CLI plugins at exact versions — see [Plugins](#plugins)
 
 ---
 
@@ -25,7 +25,7 @@ Composite GitHub Action that installs [@beplus/be](https://github.com/beplus/be)
 | `BE_CLI_VERSION` | No | empty | Version or channel of beplus CLI to install (passed to `be`). Empty installs the repository's pin (`be auto`), or `latest` with a warning when there is none. A value here wins over the pin. |
 | `BE_NPM_AUTH` | No | `false` | If `true`, runs `beplus npm auth` |
 | `BE_NPM_CHECK` | No | empty | Package directories (space- or newline-separated, relative to the workspace) whose `@beplus` dependencies name the probe: ONE of them must come back from the registry as a real package (the token reached the job and was taken). Needs `npm` and `jq`. Empty: no check. |
-| `BE_PLUGINS` | No | empty | beplus CLI plugins to install after the CLI, each `<package>@<exact version>`, space- or newline-separated. A range, a tag, a path or no version fails the run. Needs `npm` and `jq`; a `@beplus` plugin needs `BE_NPM_AUTH`. See [Plugins](#plugins). |
+| `BE_CLI_PLUGINS` | No | empty | beplus CLI plugins to install after the CLI, each `<package>@<exact version>`, space- or newline-separated. A range, a tag, a path or no version fails the run. Needs `npm` and `jq`; a `@beplus` plugin needs `BE_NPM_AUTH`. See [Plugins](#plugins). |
 | `BE_PREFIX` | No | empty | Install prefix for beplus binaries. If empty, defaults to `$HOME/.beplus`. Must be writable. |
 | `BE_WORKING_DIRECTORY` | No | the workspace | Where the pin is looked up: the nearest `beplus.estate.json` at or above this directory, exactly as `be auto` finds it. Relative to the workspace. |
 
@@ -88,7 +88,7 @@ auth` ran):
     BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
   with:
     BE_NPM_AUTH: true
-    BE_PLUGINS: "@beplus/cli-plugin-electron@0.1.0"
+    BE_CLI_PLUGINS: "@beplus/cli-plugin-electron@0.1.0"
 ```
 
 A plugin is code that runs as the job, so it is pinned like the CLI: every spec
