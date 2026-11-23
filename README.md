@@ -10,7 +10,9 @@ Composite GitHub Action collection for setting up the beplus Environment in GitH
 Installs the beplus CLI (`@beplus/be` and `beplus`) with optional npm authentication —
 the version the repository pins in `beplus.estate.json` → `cli.version` (`be auto`).
 A repository without a pin gets `latest` and a warning that it floats; see
-[Pinning the CLI](./cli/README.md#pinning-the-cli).
+[Pinning the CLI](./cli/README.md#pinning-the-cli). `BE_CLI_PLUGINS` installs CLI
+plugins the CLI does not bundle, each at an exact version; see
+[Plugins](./cli/README.md#plugins).
 
 ```yaml
 - uses: beplus/setup-beplus/cli@v2
