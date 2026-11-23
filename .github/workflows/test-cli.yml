@@ -17,7 +17,7 @@
 # the @beplus read with HTTP 200 and its stub body, so the check must fail the
 # run — before any install would have.
 #
-# BE_PLUGINS (the `plugins` job): a spec that is not <package>@<exact version>
+# BE_CLI_PLUGINS (the `plugins` job): a spec that is not <package>@<exact version>
 # fails the run before anything is installed, and a pinned plugin is installed
 # from npm.beplus.cloud and loaded at exactly its version. That leg needs a
 # token: the repository secret BE_NPM_TOKEN (prod's, where the plugins are
@@ -183,7 +183,7 @@ jobs:
           BE_CLI_VERSION: 2.40.1
           BE_WORKING_DIRECTORY: ${{ runner.temp }}
           BE_NPM_AUTH: ${{ matrix.expect == 'installed' && 'true' || 'false' }}
-          BE_PLUGINS: ${{ matrix.plugins }}
+          BE_CLI_PLUGINS: ${{ matrix.plugins }}
 
       - name: Assert the outcome
         shell: bash
