@@ -362,6 +362,36 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # The Apple team signs the app and names the match store's branch (the Matchfile's git_branch).
+      # The caller's variables BE_APPLE_DEVELOPER_TEAM_ID and BE_APPLE_DEVELOPER_TEAM_NAME win when set
+      # (a product with its own team, as MRKIT); otherwise fastlane/.env.default's stand (the beplus team).
+      # Exported only when set: an empty variable would hide .env.default's value from fastlane.
+      - name: The Apple team
+        working-directory: ${{ inputs.app-dir }}
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          V_TEAM_ID: ${{ vars.BE_APPLE_DEVELOPER_TEAM_ID }}
+          V_TEAM_NAME: ${{ vars.BE_APPLE_DEVELOPER_TEAM_NAME }}
+        run: |
+          set -euo pipefail
+          from_file() {
+            [ -f fastlane/.env.default ] || return 0
+            sed -nE "s/^$1=\"?([^\"]*)\"?\$/\1/p" fastlane/.env.default | tail -1
+          }
+          [ -z "$V_TEAM_ID" ] || echo "BE_APPLE_DEVELOPER_TEAM_ID=$V_TEAM_ID" >> "$GITHUB_ENV"
+          [ -z "$V_TEAM_NAME" ] || echo "BE_APPLE_DEVELOPER_TEAM_NAME=$V_TEAM_NAME" >> "$GITHUB_ENV"
+          team_id="${V_TEAM_ID:-$(from_file BE_APPLE_DEVELOPER_TEAM_ID)}"
+          team_name="${V_TEAM_NAME:-$(from_file BE_APPLE_DEVELOPER_TEAM_NAME)}"
+          missing=0
+          for pair in "BE_APPLE_DEVELOPER_TEAM_ID=$team_id" "BE_APPLE_DEVELOPER_TEAM_NAME=$team_name"; do
+            if [ -z "${pair#*=}" ]; then
+              echo "::error::${pair%%=*} is empty. Set it as a variable of the repository, its organization or the environment '${ENVIRONMENT}', or in fastlane/.env.default."
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ] || exit 1
+          echo "Apple team: $team_name ($team_id)"
+
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}

@@ -585,6 +585,14 @@ a passed one. build-mac checks its seven secrets before it builds, and
 build-windows its npm token (and `AZURE_*` for a signed release), naming each one
 that is empty.
 
+The Apple team that signs the Mac app, and names the match store's branch, is
+`BE_APPLE_DEVELOPER_TEAM_ID` and `BE_APPLE_DEVELOPER_TEAM_NAME`. Variables are
+the caller's own, so nothing passes them: a repository's, organization's or
+`environment`'s variable wins when set (a product with its own team, as MRKIT),
+and otherwise the app's `fastlane/.env.default` stands (the beplus team).
+build-mac stops before the build when neither names one. Without it, match
+fails late with `fatal: '' is not a valid branch name`.
+
 ---
 
 ## Quick Start
