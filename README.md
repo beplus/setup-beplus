@@ -352,6 +352,34 @@ jobs:
 | `github-environment` | none | The environment holding `BE_NPM_TOKEN` (bepluscloud, MRKIT: `dev`) |
 | `node-version` | `22.14` | |
 | `timeout-minutes` | `40` | The checks job's |
+| `uix-check` | `false` | Runs `uix-check` (the bin of `@beplus/uix` 0.66.0+) as the first check; see below |
+
+**`uix-check: true`** runs the View checks of One View in the app's CI:
+`uix.view-on-uix`, `uix.view-definition`, `uix.filter-coverage`,
+`uix.filter-one-home` and `uix.single-copy`, with every rule the product's
+profile adopts.
+- It runs the way `npm run check:i18n` runs in a caller's `checks`: one more
+  check in the list, first, counted and shown in the summary like the others.
+- It runs in the working directory, so it is the bin of the project's own
+  `@beplus/uix` (`node_modules/.bin/uix-check`). Its `--root` is the repository,
+  where it reads the profile (`guidelines/uix.md`) and `uix-ratchet.json`.
+- It fails on a MUST violation and on a ratchet entry with nothing left to
+  allow, so the ratchet only goes down.
+- A project without the bin (no `@beplus/uix`, or one older than 0.66.0) fails
+  the check at once, with an annotation saying so.
+- With `pr-gate`, a change under `guidelines/` or to `uix-ratchet.json` runs
+  the checks too. No Rush project holds those files, so the project's impact
+  alone would miss them.
+
+```yaml
+    with:
+      project: "@bepluscloud/console"
+      pr-gate: true
+      uix-check: true
+      checks: |
+        npm run check:i18n
+        npm run typecheck
+```
 
 The check is named `<caller job> / checks` (`console / checks`). It reaches no
 database but its own service, reads no connection secret and assumes no AWS

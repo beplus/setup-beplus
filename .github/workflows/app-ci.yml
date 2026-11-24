@@ -39,7 +39,10 @@
 #   6. `checks`, one command per line, in the project's folder. EVERY check runs,
 #      even after one has failed, so one failure does not hide another; the job
 #      fails if any did, each failure is an annotation on the run, and the job
-#      summary lists every check with its result and time.
+#      summary lists every check with its result and time. With `uix-check: true`,
+#      the first check is `uix-check`, the bin of the project's own @beplus/uix:
+#      the View checks against the repository's guidelines/uix.md and
+#      uix-ratchet.json.
 #
 # What stays in the repository is what is the repository's: when it runs, the
 # permissions it grants, the concurrency group, and the commands.
@@ -146,6 +149,19 @@ on:
         required: false
         type: string
         default: ""
+      uix-check:
+        description: >-
+          Run `uix-check`, the bin @beplus/uix ships (0.66.0 and later), as the first
+          check: in the working directory, so it is the project's own @beplus/uix,
+          with `--root` at the repository, where it reads the product profile
+          (guidelines/uix.md) and uix-ratchet.json. It runs the View checks
+          (uix.view-on-uix, uix.view-definition, uix.filter-coverage,
+          uix.filter-one-home, uix.single-copy) and fails on a MUST violation or on a
+          ratchet entry with nothing left to allow, as every other check does. With
+          `pr-gate`, a change to guidelines/ or uix-ratchet.json runs the checks too.
+        required: false
+        type: boolean
+        default: false
     secrets:
       BE_NPM_TOKEN:
         description: >-
@@ -255,6 +271,28 @@ jobs:
 
       # Last in `plan`: with a project to weigh it checks out the PR's head with its whole
       # history (blobless), which the steps above must not read.
+      # uix-check reads the repository's guidelines/ and uix-ratchet.json, which no Rush
+      # project holds: with it on, a change to either runs the checks as well.
+      - name: What the PR gate weighs
+        id: weigh
+        if: inputs.pr-gate
+        env:
+          GATE_PATHS: ${{ inputs.gate-paths }}
+          UIX_CHECK: ${{ inputs.uix-check }}
+        run: |
+          set -euo pipefail
+          paths="$GATE_PATHS"
+          if [ "$UIX_CHECK" = true ]; then
+            paths+="${paths:+$'\n'}guidelines/*"$'\n'"uix-ratchet.json"
+          fi
+          if [ -n "$paths" ]; then
+            {
+              echo "paths<<__PATHS__"
+              printf '%s\n' "$paths"
+              echo "__PATHS__"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: PR gate
         id: gate
         if: inputs.pr-gate
@@ -262,7 +300,7 @@ jobs:
         with:
           stack: top-only
           projects: ${{ inputs.gate-paths == '' && inputs.project || '' }}
-          paths: ${{ inputs.gate-paths }}
+          paths: ${{ steps.weigh.outputs.paths }}
           node-version: ${{ inputs.node-version }}
 
   checks:
@@ -399,9 +437,19 @@ jobs:
         env:
           CHECKS: ${{ inputs.checks }}
           DIRECTORY: ${{ needs.plan.outputs.directory }}
+          UIX_CHECK: ${{ inputs.uix-check }}
         run: |
           # Not -e (GitHub's default for `run`): a failed check is counted, and the next one runs.
           set +e -uo pipefail
+          # The project's own @beplus/uix, by its bin in this folder (never npx: with no bin it
+          # asks the registry for a package named uix-check), against the profile and ratchet
+          # at the repository's root. Without the bin the check fails at once, saying why.
+          if [ "$UIX_CHECK" = true ]; then
+            if [ ! -x node_modules/.bin/uix-check ]; then
+              echo "::error title=uix-check::$DIRECTORY has no node_modules/.bin/uix-check: \`uix-check: true\` needs @beplus/uix 0.66.0 or later as a dependency of the project."
+            fi
+            CHECKS='node_modules/.bin/uix-check --root "$GITHUB_WORKSPACE"'$'\n'"$CHECKS"
+          fi
           ran=0
           failed=0
           rows=""
