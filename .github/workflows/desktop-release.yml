@@ -355,7 +355,7 @@ jobs:
           done
           if [ "${#missing[@]}" -gt 0 ]; then
             for name in "${missing[@]}"; do
-              echo "::error::${name} is empty. Pass it in the caller's secrets: block (\`${name}: \${{ secrets.${name} }}\`), or set it in the environment '${ENVIRONMENT}'."
+              echo "::error::${name} is empty. Pass it in the caller's secrets: block (a line \`${name}:\` set to the caller's secrets.${name}), or set it in the environment '${ENVIRONMENT}'."
             done
             exit 1
           fi
@@ -523,7 +523,7 @@ jobs:
           for name in "${names[@]}"; do
             var="S_${name#BE_}"
             if [ -z "${!var}" ]; then
-              echo "::error::${name} is empty. Pass it in the caller's secrets: block (\`${name}: \${{ secrets.${name} }}\`), or set it in the environment '${ENVIRONMENT}'."
+              echo "::error::${name} is empty. Pass it in the caller's secrets: block (a line \`${name}:\` set to the caller's secrets.${name}), or set it in the environment '${ENVIRONMENT}'."
               missing=1
             fi
           done
