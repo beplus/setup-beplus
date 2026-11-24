@@ -491,9 +491,21 @@ jobs:
       windows: ${{ vars.BE_DESKTOP_WINDOWS }}
       linux: ${{ vars.BE_DESKTOP_LINUX }}
       npm-target: ${{ vars.BE_NPM_TARGET }}
-    secrets:
+    secrets: # every one, by name, whatever level it lives at
       BE_NPM_TOKEN: ${{ secrets.BE_NPM_TOKEN }}
+      BE_GITHUB_APP_ID: ${{ secrets.BE_GITHUB_APP_ID }}
+      BE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.BE_GITHUB_APP_PRIVATE_KEY }}
+      BE_APPSTORE_CONNECT_KEY_ID: ${{ secrets.BE_APPSTORE_CONNECT_KEY_ID }}
+      BE_APPSTORE_CONNECT_KEY_ISSUER_ID: ${{ secrets.BE_APPSTORE_CONNECT_KEY_ISSUER_ID }}
+      BE_APPSTORE_CONNECT_KEY_CONTENT: ${{ secrets.BE_APPSTORE_CONNECT_KEY_CONTENT }}
+      BE_FASTLANE_MATCH_PASSWORD: ${{ secrets.BE_FASTLANE_MATCH_PASSWORD }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
 ```
+
+Every estate's caller is this file, with its own `with:` values: bepluscloud's,
+Mountaineer's and MRKIT's differ in nothing else.
 
 - **plan** reads `app-dir`'s package.json version, refuses a tag that is not
   `<tag-prefix><version>`, and decides which platforms build.
@@ -558,15 +570,20 @@ last, holding `"smoke":"ok"` and `"version":"<version>"`.
 | `npm-target` | `beplus.cloud` | npm.<target>; pass `vars.BE_NPM_TARGET` |
 | `test`, `test-windows`, `test-linux` | `npm test` | The tests in `app-dir` per platform |
 | `linux-apt` | none | Extra apt packages for the Linux job |
+| `linux-check` | none | More checks of the installed x64 .deb after its smoke run (the beplus app: its Terminal) |
 | `build-env` | none | `KEY=VALUE` lines for every pack and smoke run (not secrets) |
 | `smoke-match` | none | A string the smoke line must also hold (e.g. the console's origin) |
 | `node-version`, `aws-region` | `22.14`, `us-east-1` | |
 
-Secrets go **by name** (`BE_NPM_TOKEN`, `BE_GITHUB_APP_ID`,
-`BE_GITHUB_APP_PRIVATE_KEY`, `BE_APPSTORE_CONNECT_KEY_*`,
-`BE_FASTLANE_MATCH_PASSWORD`, `AZURE_*`), because GitHub passes `inherit` only to a
-workflow of the same organization or enterprise. A secret in `environment` is
-read by the jobs that claim it and needs no passing.
+Secrets go **by name**, all ten of them as above, because GitHub passes
+`inherit` only to a workflow of the same organization or enterprise. A
+repository's or an organization's secret reaches the workflow only through the
+caller's `secrets:` block; one the block leaves out arrives empty (Mountaineer's
+and MRKIT's first tags failed that way: `BE_APPSTORE_CONNECT_KEY_CONTENT isn't
+set`). A secret in `environment` is read by the jobs that claim it and wins over
+a passed one. build-mac checks its seven secrets before it builds, and
+build-windows its npm token (and `AZURE_*` for a signed release), naming each one
+that is empty.
 
 ---
 
