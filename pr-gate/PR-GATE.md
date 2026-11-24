@@ -27,9 +27,24 @@ top never did.
   link the stack, then mark the PRs ready. `ready_for_review` starts the run.
 - **PG-D2: In a stack, only the top PR runs.** Its head holds every change of the
   PRs below it, and a stack merges in one go (`gh stack merge`), so `dev` ends at
-  the top's tree. A PR is "below" when another open PR (draft or not) is based on
-  its branch. The checks a lower PR skips report "skipped", with the reason in
-  the run's summary ("#681 is based on #680's branch…").
+  the top's tree. A PR skips only when a **ready** PR is above it: one based on
+  its branch, or on the branch of a draft that is. The checks a lower PR skips
+  report "skipped", with the reason in the run's summary ("#681 is based on
+  #680's branch…").
+  - **A draft above covers nothing.** A draft runs nothing (PG-D1), so a PR whose
+    only PRs above are drafts runs its own checks, and its summary says so
+    ("Only drafts are above #885 (#886)…"). Before this rule, bepluscloud/ai#885
+    reported "skipped" under the draft #886 and merged into `dev` without
+    console CI.
+  - **A ready PR above a draft above a PR** (#1 ← draft #2 ← ready #3): #3 is the
+    top and runs, and its tree holds #2's and #1's changes, so #1 skips ("#3
+    (ready) is above #1 in its stack, past the draft #2…") and the draft #2 runs
+    nothing. The stack cannot merge until #2 is marked ready. Once it is, #3
+    above it covers it and it skips. #1 can merge on its own before that, as
+    any lower PR can (see "A PR merged on its own" below).
+  - **A top PR turned back into a draft** leaves the PRs below it with their
+    "skipped". Nothing re-runs them by itself. Push to the PR below, or mark it
+    ready again, to give it its own run.
   - **What this gives up:** the commits between the bottom and the top of a
     stack are not each tested on `dev` (`git bisect` is coarser by a stack).
     Releases are cut from `dev`'s head, which is what the top tested.

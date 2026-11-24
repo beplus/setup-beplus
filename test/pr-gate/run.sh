@@ -16,7 +16,8 @@ yq '.runs.steps[] | select(.id == "decide") | .run' "$action" > "$work/decide.sh
 always="$(yq '.inputs.always.default' "$action")"
 
 # A fake gh: `pulls?base=<b>` answers the PRs based on <b>, `pulls?head=<owner>:<h>` the PR
-# whose head is <h>, from $work/prs (number base head repo per line). FAIL_GH makes it fail.
+# whose head is <h>, from $work/prs (number base head repo [draft] per line; draft defaults to
+# false). FAIL_GH makes it fail.
 mkdir -p "$work/bin"
 cat > "$work/bin/gh" << 'EOF'
 #!/usr/bin/env bash
@@ -31,10 +32,10 @@ while [[ $# -gt 0 ]]; do
 done
 json="["
 sep=""
-while read -r n b h r; do
+while read -r n b h r d; do
   [[ -z "$n" ]] && continue
   if { [[ -n "$base" && "$b" == "$base" ]] || [[ -n "$head" && "$h" == "$head" ]]; }; then
-    json+="$sep{\"number\":$n,\"base\":{\"ref\":\"$b\"},\"head\":{\"ref\":\"$h\",\"repo\":{\"full_name\":\"$r\"}}}"
+    json+="$sep{\"number\":$n,\"draft\":${d:-false},\"base\":{\"ref\":\"$b\"},\"head\":{\"ref\":\"$h\",\"repo\":{\"full_name\":\"$r\"}}}"
     sep=","
   fi
 done < "$PRS"
@@ -45,6 +46,11 @@ chmod +x "$work/bin/gh"
 export PATH="$work/bin:$PATH" PRS="$work/prs"
 
 failures=0
+has() { # <case> <key> <wanted substring> <outputs file>
+  local got
+  got="$(sed -n "s/^$2=//p" "$4" | tail -n 1)"
+  if [[ "$got" == *"$3"* ]]; then echo "✓ $1 ($2 has \"$3\")"; else echo "✗ $1: $2 is \"$got\", want it to have \"$3\""; failures=$((failures + 1)); fi
+}
 expect() { # <case> <key> <want> <outputs file>
   local got
   got="$(sed -n "s/^$2=//p" "$4" | tail -n 1)"
@@ -61,20 +67,50 @@ stack() { # <case> <draft> <head> <base> <want decided> <want run|root> [head re
 }
 
 # The stack: #1 dev <- a, #2 a <- b, #3 b <- c (the top); #4 dev <- x, alone; #5 a fork's PR.
+# Drafts above (bepluscloud/ai#885 merged untested under draft #886):
+#   #6 dev <- p, ready, with only the draft #7 p <- q above it;
+#   #8 dev <- r, ready, the draft #10 r <- s, and the ready #11 s <- t on top;
+#   #12 dev <- u, ready, the drafts #13 u <- v and #14 v <- w above it;
+#   #15 dev <- y, ready, with the draft #16 and the ready #17 both based on y.
 cat > "$PRS" << 'EOF'
 1 dev a o/r
 2 a b o/r
 3 b c o/r
 4 dev x o/r
 5 dev c fork/r
+6 dev p o/r false
+7 p q o/r true
+8 dev r o/r false
+10 r s o/r true
+11 s t o/r false
+12 dev u o/r false
+13 u v o/r true
+14 v w o/r true
+15 dev y o/r false
+16 y y1 o/r true
+17 y y2 o/r false
 EOF
 
 stack "a draft runs nothing" true c b true false
 stack "the bottom of a stack skips" false a dev true false
 stack "the middle of a stack skips" false b a true false
+has "…and its reason names the PR above" reason "#3 is based on #9's branch" "$work/out"
 stack "the top of a stack runs, from dev" false c b false dev
 stack "a PR alone runs, from dev" false x dev false dev
 stack "a fork's PR is never below another" false c dev false dev fork/r
+stack "a ready PR beside a draft above covers it" false y dev true false
+has "…and its reason names the ready one" reason "#17 is based on #9's branch" "$work/out"
+
+stack "a PR with only a draft above runs its own checks" false p dev false dev
+expect "…and names the draft" drafts "#7" "$work/out"
+stack "the draft above it runs nothing" true q p true false
+stack "a PR with two drafts above runs its own checks" false u dev false dev
+expect "…and names both" drafts "#13, #14" "$work/out"
+
+stack "a PR below a draft below a ready top skips" false r dev true false
+has "…and its reason names the top past the draft" reason "#11 (ready) is above #9 in its stack, past the draft #10" "$work/out"
+stack "the draft in the middle runs nothing" true s r true false
+stack "the ready top past a draft runs, from dev" false t s false dev
 
 out="$work/out"; : > "$out"
 GITHUB_OUTPUT="$out" EVENT=push bash "$work/stack.sh" > /dev/null 2>&1
@@ -106,6 +142,11 @@ decide() { # <case> <projects> <paths> <want run>
 }
 
 decide "the top with no project or path runs" "" "" true
+: > "$out"
+(cd "$repo" && GITHUB_OUTPUT="$out" GITHUB_STEP_SUMMARY=/dev/null DECIDED=false ROOT=dev NUMBER=6 DRAFTS="#7" \
+  HEAD_SHA="$head_sha" PROJECTS="" PATHS="" ALWAYS="$always" bash "$work/decide.sh" > /dev/null 2>&1)
+expect "a PR with only drafts above runs" run true "$out"
+has "…and says why" reason "Only drafts are above #6 (#7)" "$out"
 decide "a path the stack changes runs" "" "packages/apps/desktop/*" true
 decide "a path the stack does not change skips" "" "packages/apps/console/*" false
 decide "projects with no rush.json fail open" "@x/console" "" true

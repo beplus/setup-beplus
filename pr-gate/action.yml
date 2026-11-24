@@ -1,7 +1,7 @@
 name: "beplus PR gate"
 description: >-
   Decides whether a pull request's checks run: never on a draft; in a stack, only on the
-  top PR (its tree holds every change below it); and, given projects or paths, only when
+  top ready PR (its tree holds every change below it; a draft above covers nothing); and, given projects or paths, only when
   the stack changes one of them. Every other event runs. One mechanism for every beplus
   estate's workflows (app-ci, library-ci, docs-pages, db-migrations-pr, infra-diff, and a
   repository's own).
@@ -12,7 +12,9 @@ description: >-
 #      PRs ready.
 #   2. Only the top PR of a stack runs. Its head holds every change of the PRs below it,
 #      and a stack merges in one go (`gh stack merge`), so dev ends at the top's tree. A
-#      PR "below" is one another open PR is based on. A PR that leaves the stack has
+#      PR skips only when a READY PR is above it: based on its branch, or on a draft's
+#      that is (a ready PR above a draft above it). A draft runs nothing, so drafts
+#      alone above a PR leave it to run its own checks. A PR that leaves the stack has
 #      nothing above it, so its next run is its own.
 #   3. Only what the stack changes. With `projects`, Rush's own `--impacted-by` over the
 #      stack's whole diff (from where it left its root branch, never from the PR's own
@@ -29,8 +31,9 @@ description: >-
 inputs:
   stack:
     description: >-
-      `top-only` (the default): a PR another open PR is based on skips; the top PR's run
-      covers it. `every`: every ready PR runs.
+      `top-only` (the default): a PR with a ready PR above it (based on its branch, or
+      on a draft above it) skips; the top PR's run covers it. Drafts alone above a PR do
+      not cover it, so it runs. `every`: every ready PR runs.
     required: false
     default: top-only
   projects:
@@ -114,16 +117,48 @@ runs:
           echo "::error::the \`stack\` input: \"$STACK\" is not top-only or every."; exit 1 ;;
         esac
 
+        # Only a READY PR above covers this one: a draft runs nothing, so a draft above covers
+        # nothing. Walk up past drafts: a ready PR above a draft above this one is the stack's
+        # top and covers it. Drafts alone above: this PR runs its own checks.
         # A fork's branch is never another PR's base here.
         if [[ "$STACK" == top-only && "$HEAD_REPO" == "$REPO" ]]; then
-          above="$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base="$HEAD_REF" -f per_page=20 \
-            --jq '[.[] | select(.head.repo.full_name == "'"$REPO"'") | .number] | map(tostring) | join(", #")' 2>/tmp/pr-gate.err)"
-          if [[ $? -ne 0 ]]; then
+          level=("$HEAD_REF") seen=" $HEAD_REF " ready="" drafts="" failed="" depth=0
+          while [[ ${#level[@]} -gt 0 && $depth -lt 20 ]]; do
+            depth=$((depth + 1)) next=() these=""
+            for ref in "${level[@]}"; do
+              if ! prs="$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base="$ref" -f per_page=20 \
+                --jq '.[] | select(.head.repo.full_name == "'"$REPO"'") | "\(.number) \(.draft) \(.head.ref)"' 2>/tmp/pr-gate.err)"; then
+                failed=1; break 2
+              fi
+              while read -r n draft head; do
+                [[ -n "$n" ]] || continue
+                if [[ "$draft" != true ]]; then
+                  ready+="${ready:+, }#$n"
+                else
+                  these+="${these:+, }#$n"
+                  [[ "$seen" == *" $head "* ]] || { seen+="$head "; next+=("$head"); }
+                fi
+              done <<< "$prs"
+            done
+            [[ -n "$ready" ]] && break
+            drafts+="${drafts:+${these:+, }}$these"
+            level=(${next[@]+"${next[@]}"})
+          done
+
+          if [[ -n "$failed" ]]; then
             echo "::warning title=PR gate::Could not list the PRs above #$NUMBER ($(head -c 200 /tmp/pr-gate.err)); the checks run. Give the workflow \`pull-requests: read\`."
-          elif [[ -n "$above" ]]; then
+          elif [[ -n "$ready" && "$depth" -eq 1 ]]; then
             out decided true; out run false
-            out reason "#$above is based on #$NUMBER's branch (above it in its stack), and the top PR's run covers this one."
+            out reason "$ready is based on #$NUMBER's branch (above it in its stack), and the top PR's run covers this one."
             exit 0
+          elif [[ -n "$ready" ]]; then
+            out decided true; out run false
+            out reason "$ready (ready) is above #$NUMBER in its stack, past the draft $drafts, and the top PR's run covers this one."
+            exit 0
+          elif [[ -n "$drafts" ]]; then
+            # The case that let bepluscloud/ai#885 merge untested: draft #886 sat above it.
+            echo "::notice title=PR gate::Only drafts are above #$NUMBER ($drafts). A draft runs nothing, so #$NUMBER runs its own checks."
+            out drafts "$drafts"
           fi
         fi
 
@@ -161,6 +196,7 @@ runs:
         RUN: ${{ steps.stack.outputs.run }}
         REASON: ${{ steps.stack.outputs.reason }}
         ROOT: ${{ steps.stack.outputs.root }}
+        DRAFTS: ${{ steps.stack.outputs.drafts }}
         NUMBER: ${{ github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         PROJECTS: ${{ inputs.projects }}
@@ -177,6 +213,7 @@ runs:
         }
         [[ "$DECIDED" == true ]] && decide "$RUN" "$REASON"
         if [[ -z "$PROJECTS" && -z "$PATHS" ]]; then
+          [[ -n "${DRAFTS:-}" ]] && decide true "Only drafts are above #$NUMBER ($DRAFTS), and a draft runs nothing: #$NUMBER runs its own checks."
           decide true "#$NUMBER is the top of its stack (or alone): it runs."
         fi
 
